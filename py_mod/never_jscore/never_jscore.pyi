@@ -19,31 +19,45 @@ class Context:
     - 多个 Context 必须按 LIFO 顺序删除（后创建先删除）
     - 推荐使用单 Context 模式，将所有函数定义在一个 Context 中
 
+    🆕 扩展功能 (enable_extensions=True 时自动加载):
+    - Base64: btoa(), atob()
+    - 哈希: md5(), sha1(), sha256(), sha512()
+    - HMAC: CryptoUtils.hmacMd5(), hmacSha1(), hmacSha256()
+    - URL 编码: encodeURIComponent(), decodeURIComponent(), encodeURI(), decodeURI()
+    - Hex: CryptoUtils.hexEncode(), hexDecode()
+    - 链式 API: CryptoUtils.createHash(), createHmac()
+
     Example:
-        >>> # 基本用法
+        >>> # 基本用法（默认启用扩展）
         >>> ctx = Context()
         >>> ctx.compile("function add(a, b) { return a + b; }")
         >>> result = ctx.call("add", [1, 2])
         >>> print(result)
         3
 
-        >>> # 异步函数（自动等待）
+        >>> # 使用扩展功能
         >>> ctx = Context()
-        >>> ctx.compile("async function asyncAdd(a, b) { return a + b; }")
-        >>> result = ctx.call("asyncAdd", [5, 3])
+        >>> result = ctx.evaluate("btoa('hello')")
         >>> print(result)
-        8
+        aGVsbG8=
 
-        >>> # Promise
-        >>> ctx = Context()
-        >>> result = ctx.evaluate("Promise.resolve(42)")
+        >>> result = ctx.evaluate("md5('hello')")
         >>> print(result)
-        42
+        5d41402abc4b2a76b9719d911017c592
+
+        >>> # 纯净 V8 环境（不加载扩展）
+        >>> ctx = Context(enable_extensions=False)
+        >>> # 只有 ECMAScript 标准 API
     """
 
-    def __init__(self) -> None:
+    def __init__(self, enable_extensions: bool = True) -> None:
         """
         创建一个新的 JavaScript 执行上下文
+
+        Args:
+            enable_extensions: 是否启用扩展（crypto, encoding 等），默认 True
+                             - True: 自动加载 btoa/atob/md5/sha256 等函数
+                             - False: 纯净 V8 环境，只包含 ECMAScript 标准 API
         """
         ...
 

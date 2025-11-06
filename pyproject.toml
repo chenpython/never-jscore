@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "never-jscore"
-version = "2.0.0"
+version = "2.1.0"
 description = "High-performance Python JavaScript execution engine based on Deno Core (V8) with full Promise/async support - py_mini_racer style API"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -35,5 +35,4 @@ Documentation = "https://github.com/neverl805/never-jscore#readme"
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
-# 包含类型提示文件
-include = ["never_jscore.pyi", "py.typed"]
+python-source = "py_mod"

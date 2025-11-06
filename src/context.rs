@@ -43,25 +43,53 @@ pub struct Context {
     runtime: RefCell<JsRuntime>,
     result_storage: Rc<ResultStorage>,
     exec_count: RefCell<usize>,
+    extensions_loaded: bool,
 }
 
+// JavaScript polyfill 代码
+const JS_POLYFILL: &str = include_str!("dddd_js/js_polyfill.js");
+
 impl Context {
-    /// 创建新的空 Context
-    pub fn new() -> PyResult<Self> {
+    /// 创建新的 Context
+    ///
+    /// # Arguments
+    /// * `enable_extensions` - 是否启用扩展（crypto, encoding 等）
+    pub fn new(enable_extensions: bool) -> PyResult<Self> {
         let storage = Rc::new(ResultStorage::new());
 
-        let runtime = JsRuntime::new(RuntimeOptions {
-            extensions: vec![
-                // 只有自定义的扩展，不使用 Deno 扩展
-                ops::pyexecjs_ext::init(storage.clone()),
-            ],
+        let mut extensions = vec![
+            // Custom ops for result storage
+            ops::pyexecjs_ext::init(storage.clone()),
+        ];
+
+        // 根据参数决定是否加载扩展
+        if enable_extensions {
+            extensions.push(crate::crypto_ops::crypto_ops::init());
+            extensions.push(crate::encoding_ops::encoding_ops::init());
+            extensions.push(crate::timer_ops::timer_ops::init());
+            extensions.push(crate::worker_ops::worker_ops::init());
+        }
+
+        let mut runtime = JsRuntime::new(RuntimeOptions {
+            extensions,
             ..Default::default()
         });
+
+        // 如果启用扩展，自动注入 JavaScript polyfill
+        if enable_extensions {
+            let _result = runtime
+                .execute_script("<polyfill>", JS_POLYFILL.to_string())
+                .map_err(|e| PyException::new_err(format!("Failed to load polyfill: {:?}", e)))?;
+
+            // Leak the v8::Global to avoid HandleScope issues
+            std::mem::forget(_result);
+        }
 
         Ok(Context {
             runtime: RefCell::new(runtime),
             result_storage: storage,
             exec_count: RefCell::new(0),
+            extensions_loaded: enable_extensions,
         })
     }
 
@@ -249,24 +277,28 @@ impl Context {
     ///
     /// 创建一个新的JavaScript执行上下文
     ///
+    /// Args:
+    ///     enable_extensions: 是否启用扩展（crypto, encoding 等），默认 True
+    ///                       - True: 启用所有扩展，自动注入 btoa/atob/md5/sha256 等函数
+    ///                       - False: 纯净 V8 环境，只包含 ECMAScript 标准 API
+    ///
     /// Example:
     ///     ```python
     ///     import never_jscore
     ///
-    ///     # 创建空上下文
+    ///     # 创建带扩展的上下文（默认）
     ///     ctx = never_jscore.Context()
+    ///     result = ctx.evaluate("btoa('hello')")  # 可以直接使用 btoa
     ///
-    ///     # 逐步添加代码
-    ///     ctx.eval("function add(a, b) { return a + b; }")
-    ///     ctx.eval("function multiply(a, b) { return a * b; }")
-    ///
-    ///     # 调用函数
-    ///     result = ctx.call("add", [1, 2])
+    ///     # 创建纯净 V8 环境
+    ///     ctx_pure = never_jscore.Context(enable_extensions=False)
+    ///     # 只有 ECMAScript 标准 API，无 btoa/atob 等
     ///     ```
     #[new]
-    fn py_new() -> PyResult<Self> {
+    #[pyo3(signature = (enable_extensions=true))]
+    fn py_new(enable_extensions: bool) -> PyResult<Self> {
         crate::runtime::ensure_v8_initialized();
-        Self::new()
+        Self::new(enable_extensions)
     }
 
     /// 编译JavaScript代码（便捷方法）

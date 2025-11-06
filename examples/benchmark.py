@@ -18,7 +18,7 @@ with open('demo.js','r',encoding='utf-8')as f:
     js_code2 = f.read()
 
 arr = list(range(100))
-iterations = 1
+iterations = 1000
 
 print("=== execjs ===")
 # ctx1 = execjs.compile(js_code)
@@ -37,9 +37,9 @@ print("=== execjs ===")
 ctx1 = execjs.compile(js_code2)
 start = time.time()
 for _ in range(iterations):
-    # ctx1.call('get_token','5fffa6895ac0748d8c76e61c1f4066d73d6501cf63c3221234')
+    ctx1.call('get_token','5fffa6895ac0748d8c76e61c1f4066d73d6501cf63c3221234')
     # ctx1.call("batch", [[1, 2, 3, 4, 5]])
-    ctx1.call("main")
+    # ctx1.call("main")
 end = time.time()
 print(f"get_token() {iterations}次耗时: {end - start:.4f}s")
 
@@ -64,18 +64,18 @@ ctx2.eval(js_code2)
 ctx2.eval(js_code)
 start = time.time()
 for _ in range(iterations):
-    # ctx2.call('get_token', '5fffa6895ac0748d8c76e61c1f4066d73d6501cf63c3221234')
-    ctx2.call("batch", [[1, 2, 3, 4, 5]])
+    ctx2.call('get_token', '5fffa6895ac0748d8c76e61c1f4066d73d6501cf63c3221234')
+    # ctx2.call("batch", [[1, 2, 3, 4, 5]])
 end = time.time()
 print(f"get_token() {iterations}次耗时: {end - start:.4f}s")
 
 
-
-ctx3 = never_jscore.compile(js_code2)
+ctx3 = never_jscore.Context()
+ctx3.compile(js_code2)
 start = time.time()
 for _ in range(iterations):
-    # ctx3.call('get_token',['5fffa6895ac0748d8c76e61c1f4066d73d6501cf63c3221234'])
-    ctx3.call("batch", [[1, 2, 3, 4, 5]])
+    ctx3.call('get_token',['5fffa6895ac0748d8c76e61c1f4066d73d6501cf63c3221234'])
+    # ctx3.call("batch", [[1, 2, 3, 4, 5]])
 end = time.time()
 print(f"get_token() {iterations}次耗时: {end - start:.4f}s")
 

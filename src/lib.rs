@@ -3,6 +3,10 @@ mod convert;
 mod ops;
 mod runtime;
 mod storage;
+mod crypto_ops;
+mod encoding_ops;
+mod timer_ops;
+mod worker_ops;
 
 use pyo3::prelude::*;
 

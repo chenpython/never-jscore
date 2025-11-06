@@ -8,19 +8,16 @@ import never_jscore
 from pathlib import Path
 import time
 
-# 读取polyfill文件
-polyfill_path = Path(__file__).parent / "polyfill_example.js"
-with open(polyfill_path, 'r', encoding='utf-8') as f:
-    polyfill_code = f.read()
 
+# polyfill.js 已删除
 
 # ============================================
-# 方式1: 将polyfill和业务代码一起编译
+# 方式1: 将业务代码编译
 # ============================================
 print("方式1: 组合编译")
 print("=" * 50)
 
-combined_code = polyfill_code + """
+combined_code = """
 
 // 现在可以使用Web API了
 function testAPIs() {
@@ -59,7 +56,6 @@ print("=" * 50)
 
 # 首先加载polyfill
 ctx2 = never_jscore.Context()
-ctx2.compile(polyfill_code)
 
 # 然后在同一个context中执行业务代码
 ctx2.eval("""
@@ -89,7 +85,7 @@ print("方式3: 模拟JS逆向场景")
 print("=" * 50)
 
 # 模拟从网站扒下来的加密JS（通常会使用各种Web API）
-reverse_js = polyfill_code + """
+reverse_js =  """
 // 这是从某个网站扒下来的加密函数（示例）
 function generateSign(params) {
     // 很多网站的加密函数会用到atob/btoa
@@ -161,7 +157,7 @@ print(f"纯JS (1000次调用): {time1:.2f}ms")
 
 # 测试2: 使用polyfill
 polyfill_ctx = never_jscore.Context()
-polyfill_ctx.compile(polyfill_code + """
+polyfill_ctx.compile( """
     function calcWithPolyfill(n) {
         // 使用一些polyfill的功能
         const encoded = btoa(String(n));
@@ -184,5 +180,3 @@ del simple_ctx
 del ctx3
 del ctx2
 del ctx1
-
-print("\n结论: polyfill会增加一些开销，但对于JS逆向来说完全可以接受")

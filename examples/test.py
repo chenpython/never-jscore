@@ -1,13 +1,21 @@
-import never_jscore as execjs
+import never_jscore
 
-# 从文件编译
-ctx = execjs.compile_file("demo.js")
-# result = ctx.call("get_token", ['5fffa6895ac0748d8c76e61c1f4066d73d6501cf63c3221234'])
-result = ctx.call("arraytest",[])
-print(result)
+js_code = """
+function add(a, b) {
+  return a + b;
+}
+function sumArray(arr) {
+  let s = 0;
+  for (let i = 0; i < arr.length; i++) s += arr[i];
+  return s;
+}
+Worker
+"""
 
-del ctx
-# 从文件执行
-result = execjs.eval_file("demo.js")
-print(result)
+ctx = never_jscore.Context()
+
+ctx.eval(js_code)
+
+
+
 
