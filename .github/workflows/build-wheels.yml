@@ -48,11 +48,6 @@ jobs:
         with:
           key: ${{ matrix.target }}-${{ matrix.python-version }}
           cache-on-failure: true
-          # 缓存 V8 构建产物
-          cache-directories: |
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
 
       - name: Build wheels
         uses: PyO3/maturin-action@v1
@@ -60,18 +55,21 @@ jobs:
           target: ${{ matrix.target }}
           args: --release --strip --out dist -i python${{ matrix.python-version }}
           manylinux: auto
-          # 使用 sccache 加速编译
           sccache: 'true'
-          # 安装编译依赖并避免从源码编译 V8
           before-script-linux: |
-            # 安装必要的编译工具 (manylinux 容器中)
+            # 安装编译依赖
             yum install -y gcc gcc-c++ make cmake libffi-devel openssl-devel || \
             dnf install -y gcc gcc-c++ make cmake libffi-devel openssl-devel || \
             apt-get update && apt-get install -y build-essential cmake libffi-dev libssl-dev || true
 
-            # 禁止从源码编译 V8
+            # 设置环境变量
             export V8_FROM_SOURCE=0
             export CARGO_NET_GIT_FETCH_WITH_CLI=true
+        env:
+          # 关键：添加链接器标志以支持 V8 的 TLS
+          RUSTFLAGS: "-C link-arg=-Wl,-z,notext"
+          # 禁止从源码编译 V8
+          V8_FROM_SOURCE: "0"
 
       - name: Upload wheels
         uses: actions/upload-artifact@v4
