@@ -34,7 +34,7 @@ struct PermissionsContainer;
 ///
 /// 使用方式类似 py_mini_racer：
 /// ```python
-/// ctx = never_jscore.Context()
+/// ctx = never_jscore.Context(enable_extensions=True, enable_logging=False)
 /// ctx.eval("function add(a, b) { return a + b; }")
 /// result = ctx.call("add", [1, 2])
 /// ```
@@ -44,6 +44,7 @@ pub struct Context {
     result_storage: Rc<ResultStorage>,
     exec_count: RefCell<usize>,
     extensions_loaded: bool,
+    logging_enabled: bool,
 }
 
 // JavaScript polyfill 代码
@@ -54,7 +55,8 @@ impl Context {
     ///
     /// # Arguments
     /// * `enable_extensions` - 是否启用扩展（crypto, encoding 等）
-    pub fn new(enable_extensions: bool) -> PyResult<Self> {
+    /// * `enable_logging` - 是否启用操作日志输出
+    pub fn new(enable_extensions: bool, enable_logging: bool) -> PyResult<Self> {
         let storage = Rc::new(ResultStorage::new());
 
         let mut extensions = vec![
@@ -66,7 +68,8 @@ impl Context {
         if enable_extensions {
             extensions.push(crate::crypto_ops::crypto_ops::init());
             extensions.push(crate::encoding_ops::encoding_ops::init());
-            extensions.push(crate::timer_ops::timer_ops::init());
+            // Use real async timers instead of fake ones
+            extensions.push(crate::timer_real_ops::timer_real_ops::init());
             extensions.push(crate::worker_ops::worker_ops::init());
             extensions.push(crate::fs_ops::fs_ops::init());
             extensions.push(crate::fetch_ops::fetch_ops::init());
@@ -84,6 +87,15 @@ impl Context {
 
         // 如果启用扩展，自动注入 JavaScript polyfill
         if enable_extensions {
+            // Set logging flag in global scope before loading polyfill
+            let logging_flag = if enable_logging { "true" } else { "false" };
+            let logging_setup = format!("globalThis.__NEVER_JSCORE_LOGGING__ = {};", logging_flag);
+
+            let _log_result = runtime
+                .execute_script("<logging_setup>", logging_setup)
+                .map_err(|e| PyException::new_err(format!("Failed to setup logging: {:?}", e)))?;
+            std::mem::forget(_log_result);
+
             let _result = runtime
                 .execute_script("<polyfill>", JS_POLYFILL.to_string())
                 .map_err(|e| PyException::new_err(format!("Failed to load polyfill: {:?}", e)))?;
@@ -97,6 +109,7 @@ impl Context {
             result_storage: storage,
             exec_count: RefCell::new(0),
             extensions_loaded: enable_extensions,
+            logging_enabled: enable_logging,
         })
     }
 
@@ -175,21 +188,60 @@ impl Context {
 
                 let _result = runtime
                     .execute_script("<eval_async>", wrapped_code)
-                    .map_err(|e| anyhow!("Execution failed: {:?}", e))?;
+                    .map_err(|e| {
+                        // 检查是否是提前返回信号
+                        let err_str = format!("{:?}", e);
+                        if err_str.contains("NEVER_JSCORE_EARLY_RETURN") || err_str.contains("EarlyReturnSignal") {
+                            // 这是提前返回，不是真正的错误
+                            return anyhow!("Early return detected");
+                        }
+                        anyhow!("Execution failed: {:?}", e)
+                    })?;
 
                 // Leak the v8::Global to avoid HandleScope issues
                 std::mem::forget(_result);
+
+                // 检查是否是提前返回
+                if self.result_storage.is_early_return() {
+                    // 提前返回：直接获取结果，不需要运行event loop
+                    let result = self
+                        .result_storage
+                        .take()
+                        .ok_or_else(|| anyhow!("Early return but no result stored"))?;
+
+                    // 清理标志
+                    self.result_storage.clear();
+
+                    // 更新执行计数
+                    let mut count = self.exec_count.borrow_mut();
+                    *count += 1;
+
+                    return Ok(result);
+                }
 
                 // 运行 event loop 等待 Promise 完成
                 runtime
                     .run_event_loop(Default::default())
                     .await
-                    .map_err(|e| anyhow!("Event loop error: {:?}", e))?;
+                    .map_err(|e| {
+                        // 检查是否是提前返回信号
+                        let err_str = format!("{:?}", e);
+                        if err_str.contains("NEVER_JSCORE_EARLY_RETURN") || err_str.contains("EarlyReturnSignal") {
+                            // 这是提前返回，不是真正的错误
+                            return anyhow!("Early return in event loop");
+                        }
+                        anyhow!("Event loop error: {:?}", e)
+                    })?;
 
                 let result = self
                     .result_storage
                     .take()
                     .ok_or_else(|| anyhow!("No result stored"))?;
+
+                // 再次检查提前返回（可能在event loop中发生）
+                if self.result_storage.is_early_return() {
+                    self.result_storage.clear();
+                }
 
                 // 更新执行计数
                 let mut count = self.exec_count.borrow_mut();
@@ -234,17 +286,34 @@ impl Context {
                 code_json
             );
 
-            let _result = runtime
-                .execute_script("<eval_sync>", wrapped_code)
-                .map_err(|e| anyhow!("Execution failed: {:?}", e))?;
+            let execute_result = runtime.execute_script("<eval_sync>", wrapped_code);
 
-            // Leak the v8::Global to avoid HandleScope issues
-            std::mem::forget(_result);
+            // 检查是否是提前返回
+            let is_early_return = if let Err(ref e) = execute_result {
+                let err_str = format!("{:?}", e);
+                err_str.contains("NEVER_JSCORE_EARLY_RETURN") || err_str.contains("EarlyReturnSignal")
+            } else {
+                false
+            };
+
+            if is_early_return {
+                // 提前返回：不需要处理执行结果
+            } else {
+                // 不是提前返回：检查错误并leak结果
+                let result_handle = execute_result
+                    .map_err(|e| anyhow!("Execution failed: {:?}", e))?;
+                std::mem::forget(result_handle);
+            }
 
             let result = self
                 .result_storage
                 .take()
                 .ok_or_else(|| anyhow!("No result stored"))?;
+
+            // 清理提前返回标志
+            if self.result_storage.is_early_return() {
+                self.result_storage.clear();
+            }
 
             let mut count = self.exec_count.borrow_mut();
             *count += 1;
@@ -288,6 +357,9 @@ impl Context {
     ///     enable_extensions: 是否启用扩展（crypto, encoding 等），默认 True
     ///                       - True: 启用所有扩展，自动注入 btoa/atob/md5/sha256 等函数
     ///                       - False: 纯净 V8 环境，只包含 ECMAScript 标准 API
+    ///     enable_logging: 是否启用操作日志输出，默认 False
+    ///                     - True: 输出所有扩展操作的日志（用于调试）
+    ///                     - False: 不输出日志（推荐生产环境）
     ///
     /// Example:
     ///     ```python
@@ -300,12 +372,15 @@ impl Context {
     ///     # 创建纯净 V8 环境
     ///     ctx_pure = never_jscore.Context(enable_extensions=False)
     ///     # 只有 ECMAScript 标准 API，无 btoa/atob 等
+    ///
+    ///     # 创建带日志的上下文（用于调试）
+    ///     ctx_debug = never_jscore.Context(enable_logging=True)
     ///     ```
     #[new]
-    #[pyo3(signature = (enable_extensions=true))]
-    fn py_new(enable_extensions: bool) -> PyResult<Self> {
+    #[pyo3(signature = (enable_extensions=true, enable_logging=false))]
+    fn py_new(enable_extensions: bool, enable_logging: bool) -> PyResult<Self> {
         crate::runtime::ensure_v8_initialized();
-        Self::new(enable_extensions)
+        Self::new(enable_extensions, enable_logging)
     }
 
     /// 编译JavaScript代码（便捷方法）

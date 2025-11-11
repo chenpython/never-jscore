@@ -2,6 +2,22 @@
 // 自动注入到 never_jscore 运行时环境
 
 // ============================================
+// Logging utility (必须在最前面定义)
+// ============================================
+
+const LOGGING_ENABLED = typeof globalThis.__NEVER_JSCORE_LOGGING__ !== 'undefined'
+    ? globalThis.__NEVER_JSCORE_LOGGING__
+    : false;
+
+function log(...args) {
+    if (LOGGING_ENABLED) {
+        console.log('[never-jscore]', ...args);
+    }
+}
+
+log('never-jscore polyfill loading...');
+
+// ============================================
 // Base64 操作 (兼容 Web API)
 // ============================================
 
@@ -321,57 +337,119 @@ globalThis.sha512 = sha512;
 globalThis.__NEVER_JSCORE_EXTENSIONS_LOADED__ = true;
 
 // ============================================
-// Timer API polyfills (setTimeout/setInterval)
+// Early Return / Hook Support
 // ============================================
 
 /**
- * Fake setTimeout - executes immediately via Promise
+ * 提前返回函数（用于Hook拦截）
+ *
+ * 在逆向工程中，当你Hook了某个函数（如XMLHttpRequest.send）并获取到参数后，
+ * 可以调用此函数立即返回结果并终止JS执行。
+ *
+ * @param {*} value - 要返回的值
+ * @throws {EarlyReturnSignal} 特殊异常用于终止执行
+ *
+ * @example
+ * // Hook XMLHttpRequest.send
+ * const originalSend = XMLHttpRequest.prototype.send;
+ * XMLHttpRequest.prototype.send = function(data) {
+ *     // 拦截参数并立即返回
+ *     __neverjscore_return__({ intercepted: data });
+ *     // 下面的代码不会执行
+ * };
+ */
+globalThis.__neverjscore_return__ = function(value) {
+    try {
+        const json = JSON.stringify(value);
+        Deno.core.ops.op_early_return(json);
+    } catch (e) {
+        // 如果无法序列化，转为字符串
+        Deno.core.ops.op_early_return(JSON.stringify(String(value)));
+    }
+
+    // 抛出特殊异常来终止执行
+    const error = new Error('[NEVER_JSCORE_EARLY_RETURN]');
+    error.name = 'EarlyReturnSignal';
+    error.__neverjscore_early_return__ = true;
+    throw error;
+};
+
+// 简短别名
+globalThis.$return = globalThis.__neverjscore_return__;
+globalThis.$exit = globalThis.__neverjscore_return__;
+
+log('Early return API loaded: __neverjscore_return__, $return, $exit');
+
+// ============================================
+// Timer API polyfills (REAL async timers)
+// ============================================
+
+/**
+ * Real async setTimeout using Rust ops
  * @param {Function} callback - 回调函数
- * @param {number} delay - 延迟（忽略，立即执行）
+ * @param {number} delay - 延迟时间（毫秒）
  * @param {...*} args - 传给回调的参数
  * @returns {number} timer ID
  */
 if (typeof setTimeout === 'undefined') {
-    const timers = new Map();
-    let nextTimerId = 1;
-
     globalThis.setTimeout = function(callback, delay = 0, ...args) {
-        const id = nextTimerId++;
+        const id = Deno.core.ops.op_get_timer_id();
 
-        // Execute immediately (not actually async!)
-        Promise.resolve().then(() => {
-            if (timers.has(id)) {
-                callback(...args);
-                timers.delete(id);
+        log(`setTimeout called: id=${id}, delay=${delay}ms`);
+
+        // Use real async timer from Rust
+        (async () => {
+            const shouldExecute = await Deno.core.ops.op_set_timeout_real(id, Math.max(0, delay | 0));
+            if (shouldExecute) {
+                log(`setTimeout executing: id=${id}`);
+                try {
+                    callback(...args);
+                } catch (e) {
+                    console.error(`Error in setTimeout callback (id=${id}):`, e);
+                }
             }
-        });
+        })();
 
-        timers.set(id, { callback, type: 'timeout' });
         return id;
     };
 
     globalThis.setInterval = function(callback, delay = 0, ...args) {
-        const id = nextTimerId++;
+        const id = Deno.core.ops.op_get_timer_id();
 
-        // Only execute once (fake interval)
-        Promise.resolve().then(() => {
-            if (timers.has(id)) {
-                callback(...args);
-                // Note: Real setInterval would repeat, but we don't
+        log(`setInterval called: id=${id}, delay=${delay}ms`);
+
+        // setInterval: repeatedly schedule the callback
+        const intervalDelay = Math.max(0, delay | 0);
+
+        const scheduleNext = async () => {
+            const shouldExecute = await Deno.core.ops.op_set_interval_real(id, intervalDelay);
+            if (shouldExecute) {
+                log(`setInterval executing: id=${id}`);
+                try {
+                    callback(...args);
+                } catch (e) {
+                    console.error(`Error in setInterval callback (id=${id}):`, e);
+                }
+                // Schedule next execution
+                scheduleNext();
             }
-        });
+        };
 
-        timers.set(id, { callback, type: 'interval' });
+        scheduleNext();
         return id;
     };
 
     globalThis.clearTimeout = function(id) {
-        timers.delete(id);
+        log(`clearTimeout called: id=${id}`);
+        Deno.core.ops.op_clear_timer(id);
     };
 
     globalThis.clearInterval = function(id) {
-        timers.delete(id);
+        log(`clearInterval called: id=${id}`);
+        Deno.core.ops.op_clear_timer(id);
     };
+
+    log('Real async timers loaded: setTimeout, setInterval, clearTimeout, clearInterval');
 }
 
 // ============================================
@@ -433,6 +511,437 @@ if (typeof Worker === 'undefined') {
     }
 
     globalThis.Worker = Worker;
+    log('Worker API loaded (single-threaded mock)');
+}
+
+// ============================================
+// Node.js Compatibility APIs
+// ============================================
+
+// queueMicrotask - standard microtask API
+if (typeof queueMicrotask === 'undefined') {
+    globalThis.queueMicrotask = function(callback) {
+        log('queueMicrotask called');
+        Promise.resolve().then(callback).catch(e => {
+            console.error('Error in microtask:', e);
+        });
+    };
+    log('queueMicrotask API loaded');
+}
+
+// setImmediate/clearImmediate - Node.js macrotask API
+if (typeof setImmediate === 'undefined') {
+    globalThis.setImmediate = function(callback, ...args) {
+        log('setImmediate called');
+        return setTimeout(callback, 0, ...args);
+    };
+
+    globalThis.clearImmediate = function(id) {
+        log(`clearImmediate called: id=${id}`);
+        clearTimeout(id);
+    };
+
+    log('setImmediate/clearImmediate APIs loaded');
+}
+
+// ============================================
+// process object - Node.js global
+// ============================================
+
+if (typeof process === 'undefined' || !process.version) {
+    globalThis.process = {
+        version: 'v22.0.0',  // Mimic Node.js 22
+        versions: {
+            node: '22.0.0',
+            v8: '12.0.267.8',
+            uv: '1.44.2',
+            zlib: '1.2.11',
+            modules: '120',
+            openssl: '3.0.10'
+        },
+        platform: (typeof Deno !== 'undefined' && typeof Deno.build !== 'undefined')
+            ? Deno.build.os
+            : 'win32',
+        arch: 'x64',
+        env: {},
+        argv: ['node', 'script.js'],
+        execPath: '/usr/bin/node',
+        execArgv: [],
+        pid: Math.floor(Math.random() * 100000) + 1000,
+        ppid: 1,
+        title: 'node',
+
+        cwd: function() {
+            if (typeof Deno !== 'undefined' && Deno.core.ops.op_fs_cwd) {
+                try {
+                    return Deno.core.ops.op_fs_cwd();
+                } catch (e) {
+                    log('Failed to get cwd from op:', e);
+                }
+            }
+            return '.';
+        },
+
+        chdir: function(directory) {
+            log(`process.chdir called: ${directory}`);
+            throw new Error('process.chdir() is not implemented');
+        },
+
+        nextTick: function(callback, ...args) {
+            log('process.nextTick called');
+            queueMicrotask(() => {
+                try {
+                    callback(...args);
+                } catch (e) {
+                    console.error('Error in nextTick callback:', e);
+                }
+            });
+        },
+
+        exit: function(code = 0) {
+            log(`process.exit called: code=${code}`);
+            throw new Error(`Process exit requested with code: ${code}`);
+        },
+
+        hrtime: function(previousTimestamp) {
+            const now = performance.now();
+            const seconds = Math.floor(now / 1000);
+            const nanoseconds = Math.floor((now % 1000) * 1e6);
+
+            if (previousTimestamp) {
+                return [
+                    seconds - previousTimestamp[0],
+                    nanoseconds - previousTimestamp[1]
+                ];
+            }
+            return [seconds, nanoseconds];
+        },
+
+        uptime: function() {
+            return Math.floor(performance.now() / 1000);
+        },
+
+        memoryUsage: function() {
+            return {
+                rss: 50 * 1024 * 1024,      // 50MB
+                heapTotal: 20 * 1024 * 1024, // 20MB
+                heapUsed: 10 * 1024 * 1024,  // 10MB
+                external: 1 * 1024 * 1024,   // 1MB
+                arrayBuffers: 0
+            };
+        }
+    };
+
+    log('process object loaded (Node.js 22 compatible)');
+}
+
+// Ensure process.nextTick exists even if process was already defined
+if (typeof process !== 'undefined' && typeof process.nextTick === 'undefined') {
+    process.nextTick = function(callback, ...args) {
+        log('process.nextTick called (fallback)');
+        queueMicrotask(() => {
+            try {
+                callback(...args);
+            } catch (e) {
+                console.error('Error in nextTick callback:', e);
+            }
+        });
+    };
+}
+
+// ============================================
+// Buffer class - Node.js core
+// ============================================
+
+if (typeof Buffer === 'undefined') {
+    class Buffer extends Uint8Array {
+        constructor(arg, encodingOrOffset, length) {
+            if (typeof arg === 'string') {
+                // Buffer.from(string, encoding)
+                const encoding = encodingOrOffset || 'utf8';
+                const bytes = Buffer._encodeString(arg, encoding);
+                super(bytes);
+            } else if (typeof arg === 'number') {
+                // Buffer.alloc(size)
+                super(arg);
+            } else if (Array.isArray(arg)) {
+                // Buffer.from(array)
+                super(arg);
+            } else if (arg instanceof ArrayBuffer || ArrayBuffer.isView(arg)) {
+                // Buffer.from(arrayBuffer) or Buffer.from(typedArray)
+                super(arg, encodingOrOffset, length);
+            } else {
+                super(0);
+            }
+        }
+
+        static _encodeString(str, encoding) {
+            encoding = encoding.toLowerCase();
+
+            if (encoding === 'utf8' || encoding === 'utf-8') {
+                // Don't use TextEncoder to avoid circular dependency
+                // Direct UTF-8 encoding implementation
+                const bytes = [];
+                for (let i = 0; i < str.length; i++) {
+                    let code = str.charCodeAt(i);
+                    if (code < 128) {
+                        bytes.push(code);
+                    } else if (code < 2048) {
+                        bytes.push(0xC0 | (code >> 6), 0x80 | (code & 0x3F));
+                    } else if (code < 65536) {
+                        bytes.push(
+                            0xE0 | (code >> 12),
+                            0x80 | ((code >> 6) & 0x3F),
+                            0x80 | (code & 0x3F)
+                        );
+                    } else {
+                        bytes.push(
+                            0xF0 | (code >> 18),
+                            0x80 | ((code >> 12) & 0x3F),
+                            0x80 | ((code >> 6) & 0x3F),
+                            0x80 | (code & 0x3F)
+                        );
+                    }
+                }
+                return bytes;
+            } else if (encoding === 'hex') {
+                const bytes = [];
+                for (let i = 0; i < str.length; i += 2) {
+                    bytes.push(parseInt(str.substr(i, 2), 16));
+                }
+                return bytes;
+            } else if (encoding === 'base64') {
+                const decoded = atob(str);
+                const bytes = [];
+                for (let i = 0; i < decoded.length; i++) {
+                    bytes.push(decoded.charCodeAt(i));
+                }
+                return bytes;
+            } else if (encoding === 'latin1' || encoding === 'binary') {
+                const bytes = [];
+                for (let i = 0; i < str.length; i++) {
+                    bytes.push(str.charCodeAt(i) & 0xFF);
+                }
+                return bytes;
+            } else if (encoding === 'ascii') {
+                const bytes = [];
+                for (let i = 0; i < str.length; i++) {
+                    bytes.push(str.charCodeAt(i) & 0x7F);
+                }
+                return bytes;
+            }
+
+            // Default to UTF-8
+            return Buffer._encodeString(str, 'utf8');
+        }
+
+        toString(encoding = 'utf8', start = 0, end = this.length) {
+            encoding = encoding.toLowerCase();
+            const slice = this.slice(start, end);
+
+            log(`Buffer.toString called: encoding=${encoding}, length=${slice.length}`);
+
+            if (encoding === 'utf8' || encoding === 'utf-8') {
+                // Direct UTF-8 decoding (don't use TextDecoder to avoid circular dependency issues)
+                let result = '';
+                for (let i = 0; i < slice.length; i++) {
+                    const byte = slice[i];
+                    if (byte < 128) {
+                        result += String.fromCharCode(byte);
+                    } else if (byte < 224) {
+                        result += String.fromCharCode(
+                            ((byte & 0x1F) << 6) | (slice[++i] & 0x3F)
+                        );
+                    } else if (byte < 240) {
+                        result += String.fromCharCode(
+                            ((byte & 0x0F) << 12) |
+                            ((slice[++i] & 0x3F) << 6) |
+                            (slice[++i] & 0x3F)
+                        );
+                    } else {
+                        const codePoint = ((byte & 0x07) << 18) |
+                            ((slice[++i] & 0x3F) << 12) |
+                            ((slice[++i] & 0x3F) << 6) |
+                            (slice[++i] & 0x3F);
+                        result += String.fromCodePoint(codePoint);
+                    }
+                }
+                return result;
+            } else if (encoding === 'hex') {
+                return Array.from(slice)
+                    .map(b => b.toString(16).padStart(2, '0'))
+                    .join('');
+            } else if (encoding === 'base64') {
+                return btoa(String.fromCharCode(...slice));
+            } else if (encoding === 'latin1' || encoding === 'binary') {
+                return String.fromCharCode(...slice);
+            } else if (encoding === 'ascii') {
+                return String.fromCharCode(...slice.map(b => b & 0x7F));
+            }
+
+            // Default to UTF-8
+            return this.toString('utf8', start, end);
+        }
+
+        write(string, offset = 0, length = this.length - offset, encoding = 'utf8') {
+            const bytes = Buffer._encodeString(string, encoding);
+            const bytesToWrite = Math.min(bytes.length, length);
+
+            for (let i = 0; i < bytesToWrite; i++) {
+                this[offset + i] = bytes[i];
+            }
+
+            return bytesToWrite;
+        }
+
+        static from(value, encodingOrOffset, length) {
+            return new Buffer(value, encodingOrOffset, length);
+        }
+
+        static alloc(size, fill, encoding) {
+            const buf = new Buffer(size);
+            if (fill !== undefined) {
+                buf.fill(fill, 0, size, encoding);
+            }
+            return buf;
+        }
+
+        static allocUnsafe(size) {
+            return new Buffer(size);
+        }
+
+        static allocUnsafeSlow(size) {
+            return new Buffer(size);
+        }
+
+        static isBuffer(obj) {
+            return obj instanceof Buffer;
+        }
+
+        static isEncoding(encoding) {
+            const validEncodings = ['utf8', 'utf-8', 'hex', 'base64', 'ascii', 'latin1', 'binary', 'ucs2', 'ucs-2', 'utf16le', 'utf-16le'];
+            return validEncodings.includes(String(encoding).toLowerCase());
+        }
+
+        static concat(list, totalLength) {
+            if (totalLength === undefined) {
+                totalLength = list.reduce((sum, buf) => sum + buf.length, 0);
+            }
+
+            const result = Buffer.alloc(totalLength);
+            let offset = 0;
+
+            for (const buf of list) {
+                result.set(buf, offset);
+                offset += buf.length;
+                if (offset >= totalLength) break;
+            }
+
+            return result;
+        }
+
+        static byteLength(string, encoding = 'utf8') {
+            if (typeof string !== 'string') {
+                return string.length;
+            }
+            return Buffer._encodeString(string, encoding).length;
+        }
+    }
+
+    globalThis.Buffer = Buffer;
+    log('Buffer class loaded (Node.js compatible)');
+}
+
+// ============================================
+// TextEncoder/TextDecoder - Standard encoding APIs
+// ============================================
+
+if (typeof TextEncoder === 'undefined') {
+    class TextEncoder {
+        constructor() {
+            this.encoding = 'utf-8';
+        }
+
+        encode(str) {
+            // Use Buffer's UTF-8 encoding
+            if (typeof Buffer !== 'undefined' && Buffer._encodeString) {
+                return new Uint8Array(Buffer._encodeString(str, 'utf8'));
+            }
+
+            // Fallback
+            const bytes = [];
+            for (let i = 0; i < str.length; i++) {
+                let code = str.charCodeAt(i);
+                if (code < 128) {
+                    bytes.push(code);
+                } else if (code < 2048) {
+                    bytes.push(0xC0 | (code >> 6), 0x80 | (code & 0x3F));
+                } else {
+                    bytes.push(
+                        0xE0 | (code >> 12),
+                        0x80 | ((code >> 6) & 0x3F),
+                        0x80 | (code & 0x3F)
+                    );
+                }
+            }
+            return new Uint8Array(bytes);
+        }
+    }
+
+    globalThis.TextEncoder = TextEncoder;
+    log('TextEncoder loaded');
+}
+
+if (typeof TextDecoder === 'undefined') {
+    class TextDecoder {
+        constructor(encoding = 'utf-8', options = {}) {
+            this.encoding = encoding.toLowerCase();
+            this.fatal = options.fatal || false;
+            this.ignoreBOM = options.ignoreBOM || false;
+        }
+
+        decode(input) {
+            if (!input) return '';
+
+            const bytes = new Uint8Array(input);
+            let result = '';
+
+            if (this.encoding === 'utf-8' || this.encoding === 'utf8') {
+                // UTF-8 decoding
+                for (let i = 0; i < bytes.length; i++) {
+                    const byte = bytes[i];
+                    if (byte < 128) {
+                        result += String.fromCharCode(byte);
+                    } else if (byte < 224) {
+                        result += String.fromCharCode(
+                            ((byte & 0x1F) << 6) | (bytes[++i] & 0x3F)
+                        );
+                    } else if (byte < 240) {
+                        result += String.fromCharCode(
+                            ((byte & 0x0F) << 12) |
+                            ((bytes[++i] & 0x3F) << 6) |
+                            (bytes[++i] & 0x3F)
+                        );
+                    } else {
+                        // 4-byte character
+                        const codePoint = ((byte & 0x07) << 18) |
+                            ((bytes[++i] & 0x3F) << 12) |
+                            ((bytes[++i] & 0x3F) << 6) |
+                            (bytes[++i] & 0x3F);
+                        result += String.fromCodePoint(codePoint);
+                    }
+                }
+            } else {
+                // Other encodings: just convert directly
+                result = String.fromCharCode(...bytes);
+            }
+
+            return result;
+        }
+    }
+
+    globalThis.TextDecoder = TextDecoder;
+    log('TextDecoder loaded');
 }
 
 // ============================================

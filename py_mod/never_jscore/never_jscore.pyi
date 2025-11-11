@@ -50,7 +50,7 @@ class Context:
         >>> # 只有 ECMAScript 标准 API
     """
 
-    def __init__(self, enable_extensions: bool = True) -> None:
+    def __init__(self, enable_extensions: bool = True,enable_logging: bool = False) -> None:
         """
         创建一个新的 JavaScript 执行上下文
 

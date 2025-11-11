@@ -6,6 +6,7 @@ mod storage;
 mod crypto_ops;
 mod encoding_ops;
 mod timer_ops;
+mod timer_real_ops;  // New: Real async timers
 mod worker_ops;
 mod fs_ops;
 mod fetch_ops;

@@ -16,6 +16,11 @@
   - 完整支持 Promise 和 async/await
   - 自动等待异步结果
   - **唯一高性能 Promise 方案**（PyMiniRacer 不支持）
+- 🎣 **Hook 拦截与提前返回** (v2.2.2):
+  - 支持在任意位置终止JS执行并返回结果
+  - Hook XMLHttpRequest.send 拦截加密数据
+  - Hook 加密函数获取中间值
+  - 完美适配 JS 逆向工程场景
 - 🌐 **完整 Web API 扩展** (v2.2.0):
   - ✅ **Node.js APIs**: require()、fs、path、fetch()
   - ✅ **浏览器存储**: localStorage、sessionStorage
@@ -77,12 +82,14 @@ A: PyExecJS 通过进程调用外部 JS 运行时，每次都有进程通信开�
 
 ## 可用测试文件
 - [benchmark.py](examples/benchmark.py) - 性能基准测试
+- [hook_examples.py](examples/hook_examples.py) - Hook拦截使用示例（v2.2.2 新增）
 - [test_async_simple.py](tests/test_async_simple.py) - 异步功能测试
 - [test_extensions.py](tests/test_extensions.py) - 扩展 API 测试
 - [test_new_apis.py](tests/test_new_apis.py) - 新 API 测试
 - [test_all_features.py](tests/test_all_features.py) - 完整功能测试套件
 - [test_browser_apis.py](tests/test_browser_apis.py) - 浏览器 API 测试
 - [test_high_priority_apis.py](tests/test_high_priority_apis.py) - 高优先级 API 测试
+- [test_hook_interception.py](tests/test_hook_interception.py) - Hook拦截功能测试（v2.2.2 新增）
 - [test_wasm.py](tests/test_wasm.py) - WebAssembly 测试
 - [use_polyfill.py](examples/use_polyfill.py) - Polyfill 使用示例
 
@@ -287,6 +294,120 @@ ctx.gc()
 # 重置统计
 ctx.reset_stats()
 ```
+
+### 7. Hook拦截与提前返回（v2.2.2 新增）
+
+```python
+import never_jscore
+
+ctx = never_jscore.Context()
+
+# 示例1: Hook XMLHttpRequest.send 拦截加密数据
+result = ctx.evaluate("""
+    (async () => {
+        // 定义加密函数
+        function encrypt(data) {
+            return btoa(JSON.stringify(data));
+        }
+
+        // Hook XMLHttpRequest.send
+        const originalSend = XMLHttpRequest.prototype.send;
+        XMLHttpRequest.prototype.send = function(data) {
+            // 拦截到加密后的数据，立即返回到Python
+            __neverjscore_return__({
+                method: this._method,
+                url: this._url,
+                encrypted_data: data  // 拦截的加密数据
+            });
+
+            // 下面的代码不会执行
+            originalSend.call(this, data);
+        };
+
+        // 执行加密和发送流程
+        const sensitiveData = {
+            username: 'test@example.com',
+            password: 'secret123',
+            timestamp: Date.now()
+        };
+
+        const encrypted = encrypt(sensitiveData);
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', 'https://api.example.com/login');
+        xhr.send(encrypted);  // 在这里被拦截并提前返回
+
+        // 不会执行到这里
+        return { status: 'sent' };
+    })()
+""")
+
+print(f"拦截到的URL: {result['url']}")
+print(f"拦截到的加密数据: {result['encrypted_data']}")
+
+# 示例2: Hook加密函数获取中间值
+result = ctx.evaluate("""
+    function multiLayerEncrypt(data) {
+        const layer1 = btoa(data);
+        const layer2 = md5(layer1);
+
+        // 在第二层加密后立即返回
+        $return({
+            layer: 2,
+            result: layer2,
+            original: data
+        });
+
+        // 第三层不会执行
+        const layer3 = sha256(layer2);
+        return layer3;
+    }
+
+    multiLayerEncrypt('sensitive_data');
+""")
+
+print(f"拦截到第{result['layer']}层加密: {result['result']}")
+
+# 示例3: 条件拦截
+result = ctx.evaluate("""
+    function processData(data) {
+        // 只有当数据包含目标标记时才拦截
+        if (data.includes('TARGET')) {
+            $exit({
+                found: true,
+                data: data,
+                position: data.indexOf('TARGET')
+            });
+        }
+        return data.toUpperCase();
+    }
+
+    processData('normal data');
+    processData('this contains TARGET marker');  // 在这里拦截
+    processData('will not reach here');  // 不会执行
+""")
+
+print(f"条件拦截结果: {result}")
+```
+
+**Hook API说明：**
+- `__neverjscore_return__(value)` - 完整函数名
+- `$return(value)` - 简短别名（推荐）
+- `$exit(value)` - 替代别名
+
+**功能特性：**
+- ✅ 立即终止JavaScript执行
+- ✅ 将拦截到的值返回到Python
+- ✅ 跳过后续所有代码（包括异步操作）
+- ✅ 支持同步和异步两种模式
+- ✅ 自动处理JSON序列化
+
+**适用场景：**
+- 🎯 Hook加密函数获取中间值
+- 🎯 拦截XMLHttpRequest.send获取请求数据
+- 🎯 提取Akamai等反爬虫的传感器数据
+- 🎯 在满足条件时提前终止并返回结果
+
+更多示例请查看 [hook_examples.py](examples/hook_examples.py)
 
 ## API 参考
 
@@ -1223,6 +1344,115 @@ signature = ctx.call("generateSignature", [
 print(f"Signature: {signature}")
 ```
 
+### Hook拦截：提取加密数据（v2.2.2 新增）
+
+```python
+import never_jscore
+
+ctx = never_jscore.Context(enable_extensions=True)
+
+# 场景1: Hook Akamai传感器生成
+result = ctx.evaluate("""
+    (async () => {
+        // 模拟Akamai传感器生成函数
+        function generateSensorData(userAgent, timestamp) {
+            const fingerprint = md5(userAgent + timestamp);
+            const hash1 = sha256(fingerprint);
+            const signature = hmacSha256('secret_key', hash1);
+
+            // Hook: 拦截传感器数据，不执行后续的网络请求
+            __neverjscore_return__({
+                sensor: signature,
+                fingerprint: fingerprint,
+                timestamp: timestamp
+            });
+
+            // 后续的网络请求不会执行
+            fetch('/verify', {
+                method: 'POST',
+                body: JSON.stringify({ sig: signature })
+            });
+        }
+
+        return generateSensorData(navigator.userAgent, Date.now());
+    })()
+""")
+
+print(f"传感器签名: {result['sensor']}")
+print(f"指纹: {result['fingerprint']}")
+
+# 场景2: 拦截多层加密的中间值
+ctx.compile("""
+    function complexEncrypt(data, key) {
+        const step1 = btoa(data);
+        const step2 = md5(step1);
+        const step3 = hmacSha256(key, step2);
+
+        // Hook第二层加密结果
+        if (globalThis.__debug_mode__) {
+            $return({
+                step: 2,
+                md5_result: step2,
+                base64_result: step1,
+                original: data
+            });
+        }
+
+        return btoa(step3);
+    }
+""")
+
+# 开启调试模式，拦截中间值
+ctx.eval("globalThis.__debug_mode__ = true;")
+result = ctx.call("complexEncrypt", ["sensitive_data", "secret_key"])
+
+print(f"拦截到第{result['step']}步: {result['md5_result']}")
+
+# 场景3: XMLHttpRequest拦截
+result = ctx.evaluate("""
+    (async () => {
+        // Hook所有XMLHttpRequest.send
+        const originalSend = XMLHttpRequest.prototype.send;
+        let interceptedRequests = [];
+
+        XMLHttpRequest.prototype.send = function(data) {
+            interceptedRequests.push({
+                url: this._url,
+                method: this._method,
+                data: data,
+                headers: this._headers
+            });
+
+            // 拦截第一个POST请求
+            if (this._method === 'POST') {
+                $return({
+                    totalRequests: interceptedRequests.length,
+                    lastRequest: interceptedRequests[interceptedRequests.length - 1]
+                });
+            }
+
+            originalSend.call(this, data);
+        };
+
+        // 执行一系列请求
+        for (let i = 0; i < 3; i++) {
+            const xhr = new XMLHttpRequest();
+            xhr.open(i === 2 ? 'POST' : 'GET', '/api/data/' + i);
+            xhr.send('data_' + i);
+        }
+    })()
+""")
+
+print(f"拦截到的请求: {result['lastRequest']}")
+```
+
+**Hook拦截的优势：**
+- ✅ 无需修改原始JS代码
+- ✅ 精确控制拦截点
+- ✅ 获取加密中间值用于分析
+- ✅ 避免执行不必要的网络请求
+- ✅ 支持条件拦截和多点拦截
+
 ### 异步数据处理
 
 ```python
@@ -1337,6 +1567,53 @@ MIT License
 - [PyO3](https://github.com/PyO3/pyo3) - Rust Python bindings
 
 ## 更新日志
+
+### v2.2.2 (2025-11-12) - Hook拦截与提前返回
+
+#### Hook拦截功能
+- ✨ **Hook拦截API**: 支持在任意位置终止JavaScript执行并返回结果
+  - `__neverjscore_return__(value)`: 完整函数名
+  - `$return(value)`: 简短别名（推荐使用）
+  - `$exit(value)`: 替代别名
+- 🎣 **提前返回机制**:
+  - 立即终止JavaScript执行
+  - 跳过后续所有代码（包括异步操作）
+  - 将拦截到的值返回到Python
+  - 支持同步和异步两种执行模式
+  - 自动处理JSON序列化（失败时降级为字符串）
+
+#### 应用场景
+- 🎯 Hook `XMLHttpRequest.send` 拦截加密请求数据
+- 🎯 Hook加密函数获取中间值
+- 🎯 提取Akamai等反爬虫的传感器数据
+- 🎯 条件拦截：只在满足条件时提前返回
+- 🎯 多点拦截：在多个位置设置拦截点
+
+#### 技术实现
+- **Rust层**: 新增 `op_early_return` 操作，添加 `early_return` 标志
+- **JavaScript层**: 通过抛出特殊异常实现立即终止
+- **异步支持**: 跳过event loop，立即返回结果
+- **同步支持**: 正确识别并处理提前返回信号
+
+#### 新增文件
+- `examples/hook_examples.py`: 5个实用Hook示例
+- `tests/test_hook_interception.py`: 13个全面测试用例（全部通过）
+- `HOOK_IMPLEMENTATION_REPORT.md`: 详细实现报告
+
+#### 修改文件
+- `src/storage.rs`: 添加 `early_return` 标志和相关方法
+- `src/ops/storage_ops.rs`: 添加 `op_early_return` 操作
+- `src/context.rs`: 异步和同步模式的提前返回处理
+- `src/dddd_js/js_polyfill.js`: 添加提前返回API，重组日志工具
+
+#### 测试覆盖
+- ✅ 13个测试用例全部通过（100%通过率）
+- ✅ Hook XMLHttpRequest.send测试
+- ✅ Hook加密函数测试
+- ✅ 条件拦截测试
+- ✅ 复杂数据结构返回测试
+- ✅ 跳过异步操作测试
+- ✅ Akamai风格Hook测试
 
 ### v2.2.1 (2025-11-11) - Performance API
 
