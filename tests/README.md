@@ -1,6 +1,6 @@
 # never-jscore 测试套件
 
-本目录包含 never-jscore v2.4.2 的完整测试用例，展示所有核心功能的使用方法。
+本目录包含 never-jscore v2.4.3+ 的完整测试用例，展示所有核心功能的使用方法。
 
 ## 运行所有测试
 
@@ -9,6 +9,21 @@ python tests/run_all_tests.py
 ```
 
 ## 测试文件列表
+
+### ⭐ NEW: `test_terminate_hook.py` - V8 强制终止 Hook 拦截
+**测试内容：**
+- 基本 `__saveAndTerminate__()` / `$terminate()` 功能
+- Hook XMLHttpRequest.send（**无法被 try-catch 捕获**）
+- 绕过 try-catch 防护（关键测试）
+- 简短别名 `$terminate` vs 完整名称
+- 对比 `$return()` vs `$terminate()` 的区别
+- 多 Context 数据隔离
+
+**关键特性：** 使用 V8 `terminate_execution()`，强制终止 JS 执行，无法被 try-catch 捕获，适合对抗加固代码
+
+**运行：** `python tests/test_terminate_hook.py`
+
+---
 
 ### 1. `test_browser_protection.py` - 浏览器环境防检测 ⭐⭐⭐
 **测试内容：**
@@ -256,16 +271,41 @@ result2 = ctx.call("encrypt", ["data"])
 assert result1 == result2  # 完全相同！
 ```
 
-### 2. 拦截加密参数
+### 2. 拦截加密参数（两种模式）
+
+**模式 A: `$return()` - 快速拦截（可被 try-catch 捕获）**
 ```python
 result = ctx.evaluate("""
     const originalEncrypt = CryptoLib.encrypt;
     CryptoLib.encrypt = function(plaintext, key) {
-        $return({ plaintext, key });  # 提取密钥！
+        $return({ plaintext, key });  # 返回密钥
     };
     login('admin', 'password');
 """)
 print(f"密钥: {result['key']}")
+```
+
+**模式 B: `$terminate()` - 强制终止（无法被 try-catch 捕获）⭐ 新增**
+```python
+ctx.clear_hook_data()
+try:
+    ctx.evaluate("""
+        const originalEncrypt = CryptoLib.encrypt;
+        CryptoLib.encrypt = function(plaintext, key) {
+            $terminate({ plaintext, key });  // 强制终止，绕过 try-catch
+        };
+        try {
+            login('admin', 'password');
+        } catch (e) {
+            // ❌ 不会执行 - $terminate 无法被捕获
+        }
+    """)
+except:
+    pass
+
+hook_data = ctx.get_hook_data()
+data = json.loads(hook_data)
+print(f"密钥: {data['key']}")
 ```
 
 ### 3. 监控属性访问
@@ -300,9 +340,11 @@ with ThreadPoolExecutor(max_workers=4) as executor:
 - ✅ 函数显示为 [native code]
 - ✅ Chrome 浏览器特征
 
-### 逆向工程工具
+### 逆向工程工具 ⭐ 新增强
 - ✅ Proxy 日志监控
-- ✅ Hook 拦截系统
+- ✅ Hook 拦截系统（双模式）
+  - `$return()` - 快速拦截
+  - `$terminate()` - **V8 强制终止，无法被 try-catch 捕获** ⭐
 - ✅ 确定性随机数
 
 ### 现代 JavaScript

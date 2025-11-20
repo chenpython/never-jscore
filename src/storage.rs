@@ -1,4 +1,12 @@
 use std::cell::RefCell;
+use std::sync::{Arc, Mutex};
+use once_cell::sync::Lazy;
+
+/// 全局 Hook 数据存储
+///
+/// 在调用 terminate_execution() 前保存 Hook 拦截的数据。
+/// 使用全局静态变量确保数据在 V8 isolate 终止后仍然可访问。
+static HOOK_DATA: Lazy<Arc<Mutex<Option<String>>>> = Lazy::new(|| Arc::new(Mutex::new(None)));
 
 /// JavaScript 执行结果存储
 ///
@@ -58,4 +66,30 @@ impl Default for ResultStorage {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// 保存 Hook 拦截的数据到全局存储
+///
+/// 这个函数在 JS 调用 __saveAndTerminate__() 时被调用，
+/// 数据会保存到全局变量中，即使 V8 isolate 被终止也能访问。
+pub fn save_hook_data(data: String) {
+    let mut guard = HOOK_DATA.lock().unwrap();
+    *guard = Some(data);
+}
+
+/// 获取保存的 Hook 数据
+///
+/// 从全局存储中读取之前保存的 Hook 数据。
+/// 通常在 JS 被 terminate_execution() 终止后调用。
+pub fn get_hook_data() -> Option<String> {
+    let guard = HOOK_DATA.lock().unwrap();
+    guard.clone()
+}
+
+/// 清空保存的 Hook 数据
+///
+/// 在开始新的 JS 执行前调用，避免读取到旧数据。
+pub fn clear_hook_data() {
+    let mut guard = HOOK_DATA.lock().unwrap();
+    *guard = None;
 }

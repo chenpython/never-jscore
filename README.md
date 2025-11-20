@@ -20,7 +20,7 @@
 | 特性 | never_jscore | PyMiniRacer | PyExecJS |
 |------|--------------|-------------|----------|
 | **Promise/async** | ✅ 完整支持 | ❌ 不支持 | ❌ 不支持 |
-| **Hook 拦截** | ✅ 内置 `$return()` | ❌ | ❌ |
+| **Hook 拦截** | ✅ 双模式：`$return()` + `$terminate()` | ❌ | ❌ |
 | **确定性随机数** | ✅ 种子控制 | ❌ | ❌ |
 | **Web API** | ✅ 完整（require/fetch/localStorage） | ❌ | ❌ |
 | **性能（1000次调用）** | **11ms** 🏆 | 38ms | 69473ms |
@@ -29,7 +29,9 @@
 
 ### 专为逆向工程设计
 
-- 🎣 **Hook 拦截系统**：在任意位置终止 JS 执行并提取中间结果
+- 🎣 **双模式 Hook 拦截**：
+  - `$return()` - 快速拦截，适合简单场景
+  - `$terminate()` - **V8 强制终止，无法被 try-catch 捕获**（v2.4.3+ 新增）
 - 🎲 **确定性调试**：固定随机数种子，轻松调试动态加密算法
 - 🌐 **零配置补环境**：内置 800+ 行 polyfill，自动模拟浏览器/Node.js 环境
 - ⚡ **极致性能**：Rust + V8 直接绑定，比 PyExecJS 快 100-300 倍
@@ -120,47 +122,97 @@ print(result)  # 25
 
 ### 🎣 Hook 拦截：提取加密数据
 
-在 JS 逆向中，经常需要拦截某个函数的调用并提取参数或返回值。`$return()` 可以立即终止执行并返回结果：
+在 JS 逆向中，经常需要拦截某个函数的调用并提取参数或返回值。never_jscore 提供**两种 Hook 模式**：
+
+#### 模式 1: `$return()` - 快速拦截（可被 try-catch 捕获）
 
 ```python
 ctx = never_jscore.Context()
 
-# 场景：Hook XMLHttpRequest.send 获取加密后的请求体
+# 适合简单场景
 encrypted_data = ctx.evaluate("""
     (async () => {
-        // Hook XMLHttpRequest.send 方法
         const originalSend = XMLHttpRequest.prototype.send;
         XMLHttpRequest.prototype.send = function(data) {
-            // 拦截加密数据，立即返回到 Python
             $return({
                 url: this._url,
-                method: this._method,
-                encrypted: data  // 这就是我们要的加密数据！
+                encrypted: data
             });
         };
 
-        // 执行目标网站的加密逻辑
         const xhr = new XMLHttpRequest();
         xhr.open('POST', 'https://api.example.com/login');
-
-        // 这里会调用网站的加密函数
-        const payload = encryptLoginData({username: 'admin', password: '123'});
-        xhr.send(payload);  // 被我们的 Hook 拦截
+        xhr.send(encryptedPayload);
     })()
 """)
 
 print(f"拦截到的加密数据: {encrypted_data['encrypted']}")
 ```
 
-**Hook API**：
-- `$return(value)` - 推荐使用（简短）
-- `$exit(value)` - 别名
-- `__neverjscore_return__(value)` - 完整函数名
+#### 模式 2: `$terminate()` - 强制终止（**无法被 try-catch 捕获** ⭐ v2.4.3+ 新增）
+
+**关键特性：** 使用 V8 `terminate_execution()`，绕过所有 try-catch 防护！
+
+```python
+import json
+
+ctx = never_jscore.Context()
+ctx.clear_hook_data()  # 清空之前的数据
+
+# Hook XMLHttpRequest.send
+ctx.compile("""
+    XMLHttpRequest.prototype.send = function(data) {
+        // ⚡ 使用 $terminate 强制终止，无法被 try-catch 捕获
+        $terminate({
+            url: this._url,
+            method: this._method,
+            encrypted: data
+        });
+    };
+""")
+
+# 执行目标代码（即使有 try-catch 也会被终止）
+try:
+    ctx.evaluate("""
+        try {
+            const xhr = new XMLHttpRequest();
+            xhr.open('POST', 'https://api.example.com/login');
+            xhr.send(encryptedPayload);
+        } catch (e) {
+            // ❌ 这里不会执行 - $terminate 无法被捕获！
+            console.log("Will not execute");
+        }
+    """)
+except Exception as e:
+    # ✅ Python 端捕获到终止
+    print(f"JS 被强制终止: {e}")
+
+# 获取拦截的数据
+hook_data = ctx.get_hook_data()
+if hook_data:
+    data = json.loads(hook_data)
+    print(f"拦截到的加密数据: {data['encrypted']}")
+```
+
+**两种模式对比：**
+
+| 特性 | `$return()` | `$terminate()` ⭐ |
+|------|-------------|-------------------|
+| 速度 | ✅ 快 | ✅ 快 |
+| try-catch | ⚠️ 可被捕获 | ✅ **无法被捕获** |
+| 适用场景 | 简单 Hook | 对抗加固代码 |
+| 数据获取 | 直接返回值 | `ctx.get_hook_data()` |
+| 多次执行 | ✅ 可复用 Context | ⚠️ 建议清理后复用 |
+
+**Hook API 总览**：
+- **模式 1：** `$return(value)`, `$exit(value)`, `__neverjscore_return__(value)`
+- **模式 2：** `$terminate(value)`, `__saveAndTerminate__(value)` ⭐ 新增
 
 **典型应用场景**：
-- 拦截网络请求的加密参数
-- 提取中间加密结果（如某个 AES/RSA 的输出）
-- 跳过验证逻辑（在关键点直接返回 true）
+- ✅ 拦截网络请求的加密参数
+- ✅ 提取中间加密结果（如 AES/RSA 的输出）
+- ✅ **绕过 try-catch 防护**（使用 `$terminate`）
+- ✅ **对抗加固的商业代码**（使用 `$terminate`）
 
 ### 🎲 确定性随机数：调试动态加密
 
@@ -864,7 +916,7 @@ with Pool(4) as pool:
 | `test_browser_protection.py` | 浏览器环境防检测 | `python tests/test_browser_protection.py` |
 | `test_proxy_logging.py` | Proxy 日志系统 | `python tests/test_proxy_logging.py` |
 | `test_random_seed.py` | 确定性随机数 | `python tests/test_random_seed.py` |
-| `test_hook_interception.py` | Hook 拦截系统 | `python tests/test_hook_interception.py` |
+| `test_terminate_hook.py` | Hook 拦截系统 | `python tests/test_terminate_hook.py` |
 | `test_async_promise.py` | Promise/async/await | `python tests/test_async_promise.py` |
 | `test_web_apis.py` | Web API（fetch, localStorage 等） | `python tests/test_web_apis.py` |
 | `test_context_management.py` | Context 管理和 with 语句 | `python tests/test_context_management.py` |
@@ -998,6 +1050,21 @@ print(f"数据: {result['data']}")
 ---
 
 ## 更新日志
+
+### v2.4.3 (2025-01-XX) ⭐ 新增
+
+- 🎯 **增强 Hook 拦截系统 - V8 强制终止**
+  - 新增 `__saveAndTerminate__()` / `$terminate()` API
+  - 使用 V8 `IsolateHandle::terminate_execution()`，**无法被 try-catch 捕获**
+  - 数据保存到全局静态存储，即使 isolate 终止也能访问
+  - Python API: `get_hook_data()` 和 `clear_hook_data()`
+  - 适用场景：对抗加固代码、绕过 try-catch 防护
+- 📚 **新增详细文档**
+  - `docs/TERMINATE_HOOK_GUIDE.md` - 完整使用指南（60+ KB）
+  - 包含最佳实践、使用场景、常见问题等
+- ✅ **完整测试覆盖**
+  - 新增 `tests/test_terminate_hook.py`
+  - 6 个测试场景，验证强制终止功能
 
 ### v2.4.2 (2025-11-17)
 - 🛡️ **增加浏览器环境防检测**

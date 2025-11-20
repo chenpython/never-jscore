@@ -440,6 +440,58 @@ globalThis.$exit = globalThis.__neverjscore_return__;
 log('Early return API loaded: __neverjscore_return__, $return, $exit');
 
 // ============================================
+// Enhanced Hook API - V8 terminate_execution (无法被 try-catch 捕获!)
+// ============================================
+
+/**
+ * 增强的 Hook 拦截 API - 使用 V8 terminate_execution()
+ *
+ * 与 $return() 的区别：
+ * - $return() 使用 throw Error，可以被 try-catch 捕获
+ * - __saveAndTerminate__() 使用 V8 terminate_execution，无法被捕获
+ *
+ * 使用场景：
+ * - 当目标代码使用了 try-catch 包裹所有逻辑时
+ * - 需要强制终止 JS 执行，不给目标代码任何恢复机会
+ *
+ * @example
+ * // Hook XHR.send 拦截加密数据
+ * XMLHttpRequest.prototype.send = function(body) {
+ *     const data = { url: this._url, body: body };
+ *     __saveAndTerminate__(data); // 保存数据并终止 (无法被 try-catch 捕获!)
+ * };
+ *
+ * @param {any} data - 要保存的数据 (会被 JSON.stringify)
+ */
+globalThis.__saveAndTerminate__ = function(data) {
+    if (typeof __getDeno !== 'undefined' && __getDeno().core && __getDeno().core.ops) {
+        try {
+            // 1. 先保存数据到 Rust 全局存储
+            const jsonData = JSON.stringify(data);
+            __getDeno().core.ops.op_save_hook_data(jsonData);
+
+            // 2. 然后调用 V8 terminate_execution (无法被 try-catch 捕获!)
+            __getDeno().core.ops.op_terminate_execution();
+        } catch (e) {
+            // 如果序列化失败，尝试转为字符串
+            const fallback = String(data);
+            __getDeno().core.ops.op_save_hook_data(fallback);
+            __getDeno().core.ops.op_terminate_execution();
+        }
+    } else {
+        // Fallback: 使用 throw error 方式（旧版本兼容）
+        const error = new Error('[__SAVE_AND_TERMINATE__] ' + JSON.stringify(data));
+        error.__save_and_terminate__ = true;
+        throw error;
+    }
+};
+
+// 简短别名
+globalThis.$terminate = globalThis.__saveAndTerminate__;
+
+log('Enhanced Hook API loaded: __saveAndTerminate__, $terminate (uses V8 terminate_execution)');
+
+// ============================================
 // Timer API - Real async timers using Rust ops
 // ============================================
 

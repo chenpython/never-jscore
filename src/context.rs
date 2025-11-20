@@ -212,10 +212,18 @@ impl Context {
             extensions.push(crate::ops::browser_env::browser_env_ops::init());
         }
 
-        let runtime = JsRuntime::new(RuntimeOptions {
+        let mut runtime = JsRuntime::new(RuntimeOptions {
             extensions,
             ..Default::default()
         });
+
+        // 获取 IsolateHandle 并存储到 OpState，用于 op_terminate_execution
+        let isolate_handle = runtime.v8_isolate().thread_safe_handle();
+        {
+            let op_state = runtime.op_state();
+            let mut op_state_mut = op_state.borrow_mut();
+            op_state_mut.put(isolate_handle);
+        }
 
         // DON'T access OpState or Isolate during construction
         // Store the seed and set it on first execution instead
@@ -952,6 +960,79 @@ impl Context {
         self.exit_isolate();
 
         Ok(())
+    }
+
+    /// 获取 Hook 拦截的数据
+    ///
+    /// 当 JavaScript 调用 __saveAndTerminate__() 或 $terminate() 时，
+    /// 数据会保存到全局存储中。使用此方法可以在 JS 被终止后获取保存的数据。
+    ///
+    /// Returns:
+    ///     Option<String>: 如果有保存的数据则返回 JSON 字符串，否则返回 None
+    ///
+    /// Example:
+    ///     ```python
+    ///     import never_jscore
+    ///     import json
+    ///
+    ///     ctx = never_jscore.Context()
+    ///
+    ///     # Hook XMLHttpRequest.send
+    ///     hook_code = '''
+    ///         XMLHttpRequest.prototype.send = function(body) {
+    ///             __saveAndTerminate__({
+    ///                 url: this._url,
+    ///                 body: body,
+    ///                 timestamp: Date.now()
+    ///             });
+    ///         };
+    ///     '''
+    ///     ctx.compile(hook_code)
+    ///
+    ///     # 执行会触发 Hook 的代码
+    ///     try:
+    ///         ctx.evaluate('''
+    ///             const xhr = new XMLHttpRequest();
+    ///             xhr.open('POST', '/api/login');
+    ///             xhr.send('{"user":"admin"}');  // 触发 Hook
+    ///         ''')
+    ///     except Exception as e:
+    ///         # JS 被 terminate，会抛出异常
+    ///         print(f"JS terminated: {e}")
+    ///
+    ///     # 获取 Hook 拦截的数据
+    ///     hook_data = ctx.get_hook_data()
+    ///     if hook_data:
+    ///         data = json.loads(hook_data)
+    ///         print(f"Intercepted URL: {data['url']}")
+    ///         print(f"Intercepted Body: {data['body']}")
+    ///     ```
+    fn get_hook_data(&self) -> Option<String> {
+        crate::storage::get_hook_data()
+    }
+
+    /// 清空保存的 Hook 数据
+    ///
+    /// 在开始新的 JS 执行前调用，避免读取到旧数据。
+    ///
+    /// Example:
+    ///     ```python
+    ///     ctx = never_jscore.Context()
+    ///
+    ///     # 清空之前的数据
+    ///     ctx.clear_hook_data()
+    ///
+    ///     # 执行新的 Hook 拦截
+    ///     try:
+    ///         ctx.evaluate('...')
+    ///     except:
+    ///         pass
+    ///
+    ///     # 获取新的数据
+    ///     data = ctx.get_hook_data()
+    ///     ```
+    fn clear_hook_data(&self) {
+        crate::storage::clear_hook_data();
     }
 
     /// 上下文管理器支持：__enter__
