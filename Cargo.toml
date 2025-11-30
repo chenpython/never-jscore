@@ -1,6 +1,6 @@
 [package]
 name = "never_jscore"
-version = "2.5.1"
+version = "2.5.0"
 edition = "2021"
 authors = ["never_jscore contributors"]
 description = "High-performance Python JavaScript execution engine based on Deno Core (V8) with full Promise/async support"
@@ -51,30 +51,29 @@ node_compat = [
 [dependencies]
 deno_core = "0.371.0"
 
-# Deno extensions from forked repo
-# https://github.com/neverl805/deno
-deno_webidl = { git = "https://github.com/neverl805/deno", branch = "main", optional = true }
-deno_web = { git = "https://github.com/neverl805/deno", branch = "main", optional = true }
-deno_crypto = { git = "https://github.com/neverl805/deno", branch = "main", optional = true }
-deno_fetch = { git = "https://github.com/neverl805/deno", branch = "main", optional = true }
-deno_net = { git = "https://github.com/neverl805/deno", branch = "main", optional = true }
-deno_tls = { git = "https://github.com/neverl805/deno", branch = "main", optional = true }
-deno_webstorage = { git = "https://github.com/neverl805/deno", branch = "main", optional = true }
-deno_permissions = { git = "https://github.com/neverl805/deno", branch = "main", optional = true }
-deno_features = { git = "https://github.com/neverl805/deno", branch = "main", optional = true }
+
+deno_webidl = { path = "G:/deno/ext/webidl", optional = true }
+deno_web = { path = "G:/deno/ext/web", optional = true }
+deno_crypto = { path = "G:/deno/ext/crypto", optional = true }
+deno_fetch = { path = "G:/deno/ext/fetch", optional = true }
+deno_net = { path = "G:/deno/ext/net", optional = true }
+deno_tls = { path = "G:/deno/ext/tls", optional = true }
+deno_webstorage = { path = "G:/deno/ext/webstorage", optional = true }
+deno_permissions = { path = "G:/deno/runtime/permissions", optional = true }
+deno_features = { path = "G:/deno/runtime/features", optional = true }
 deno_error = { version = "0.7.0", optional = true }
 sys_traits = { version = "0.1.17", features = ["libc", "real", "winapi"], optional = true }
 
-# Node.js 兼容层依赖
-deno_node = { git = "https://github.com/neverl805/deno", branch = "main", optional = true }
-deno_fs = { git = "https://github.com/neverl805/deno", branch = "main", optional = true }
-deno_io = { git = "https://github.com/neverl805/deno", branch = "main", optional = true }
-deno_os = { git = "https://github.com/neverl805/deno", branch = "main", optional = true }
-deno_process = { git = "https://github.com/neverl805/deno", branch = "main", optional = true }
-node_resolver = { git = "https://github.com/neverl805/deno", branch = "main", optional = true }
-deno_package_json = { git = "https://github.com/neverl805/deno", branch = "main", optional = true }
-deno_maybe_sync = { git = "https://github.com/neverl805/deno", branch = "main", optional = true }
-deno_crypto_provider = { git = "https://github.com/neverl805/deno", branch = "main", optional = true }
+# Node.js 兼容层依赖（按 deno 为准）
+deno_node = { path = "G:/deno/ext/node", optional = true }
+deno_fs = { path = "G:/deno/ext/fs", optional = true }
+deno_io = { path = "G:/deno/ext/io", optional = true }
+deno_os = { path = "G:/deno/ext/os", optional = true }
+deno_process = { path = "G:/deno/ext/process", optional = true }
+node_resolver = { path = "G:/deno/libs/node_resolver", optional = true }
+deno_package_json = { path = "G:/deno/libs/package_json", optional = true }
+deno_maybe_sync = { path = "G:/deno/libs/maybe_sync", optional = true }
+deno_crypto_provider = { path = "G:/deno/libs/crypto", optional = true }
 
 # Python bindings
 pyo3 = { version = "0.27.1", features = ["extension-module", "abi3-py38"] }
