@@ -1169,6 +1169,12 @@ print(f"数据: {result['data']}")
 
 ## 更新日志
 
+### v2.5.2 (2025-12-26)
+- 🎯 **新增canvas 2d相关操作api,用于代替node-canvas库补环境,具体详情看canvas文档[CANVAS_API_REFERENCE.md](docs/CANVAS_API_REFERENCE.md)**
+- 🔧 优化编译参数配置,平衡性能速度,减小编译产物体积,linux版whl 从41m减小至29m
+- 🛡️ deno_core 版本更新至0.376.0, 使用的142.2.0版本v8
+- [NODEJS_V25_API_COMPARISON.md](NODEJS_V25_API_COMPARISON.md) 该库当前所实现的api与nodejs对比
+
 ### v2.5.1 (2025-11-30)
 - 🔍 **Proxy 日志系统重构**
 - 🔧 修复 localStorage 和 sessionStorage 函数方法没有暴露的问题

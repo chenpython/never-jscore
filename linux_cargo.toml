@@ -110,6 +110,18 @@ thiserror = { version = "2.0", optional = true }
 boxed_error = { version = "0.2", optional = true }
 deno_ast = { version = "0.50.3", features = ["transpiling"], optional = true }
 
+# Canvas 支持
+# 使用纯 Rust 实现的 tiny-skia，避免复杂的 C++ 编译
+tiny-skia = { version = "0.11", optional = true }
+csscolorparser = { version = "0.8.1", optional = true }
+# 如果需要文本渲染
+fontdb = { version = "0.21", optional = true }
+resvg = { version = "0.44", default-features = false, optional = true }
+# PNG 编码支持
+png = { version = "0.17", optional = true }
+# 多格式图像编解码支持 (JPEG, WebP, etc.)
+image = { version = "0.25", default-features = false, features = ["jpeg", "webp", "png"], optional = true }
+
 # Windows系统依赖 (node_compat需要)
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59.0", features = [
