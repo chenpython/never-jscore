@@ -17,6 +17,28 @@ impl NeverJsCoreRequireLoader {
     pub fn new_rc() -> NodeRequireLoaderRc {
         Rc::new(Self)
     }
+
+    /// Find the nearest package.json and check its "type" field
+    fn find_package_type(file_path: &Path) -> Option<String> {
+        let mut current = file_path.parent();
+
+        while let Some(dir) = current {
+            let package_json = dir.join("package.json");
+            if package_json.exists() {
+                if let Ok(content) = std::fs::read_to_string(&package_json) {
+                    if let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&content) {
+                        if let Some(pkg_type) = pkg.get("type").and_then(|t| t.as_str()) {
+                            return Some(pkg_type.to_string());
+                        }
+                    }
+                }
+                // Found package.json but no "type" field means CJS (default)
+                return None;
+            }
+            current = dir.parent();
+        }
+        None
+    }
 }
 
 impl NodeRequireLoader for NeverJsCoreRequireLoader {
@@ -38,13 +60,26 @@ impl NodeRequireLoader for NeverJsCoreRequireLoader {
     }
 
     fn is_maybe_cjs(&self, specifier: &Url) -> Result<bool, PackageJsonLoadError> {
-        // Check if the file might be CommonJS
-        // For simplicity, assume .js files are CommonJS unless proven otherwise
-        if let Some(path_segments) = specifier.path_segments() {
-            if let Some(last) = path_segments.last() {
-                return Ok(last.ends_with(".js") || last.ends_with(".cjs"));
+        // Convert URL to file path
+        let file_path = match specifier.to_file_path() {
+            Ok(p) => p,
+            Err(_) => return Ok(true), // Default to CJS if can't get path
+        };
+
+        // Check file extension first
+        if let Some(ext) = file_path.extension().and_then(|e| e.to_str()) {
+            match ext {
+                "cjs" => return Ok(true),   // Explicit CommonJS
+                "mjs" => return Ok(false),  // Explicit ESM
+                "json" => return Ok(false), // JSON is not CJS
+                _ => {}
             }
         }
-        Ok(true)
+
+        // For .js files, check package.json "type" field
+        match Self::find_package_type(&file_path) {
+            Some(ref t) if t == "module" => Ok(false),  // ESM
+            _ => Ok(true),  // CJS (default when no type or type="commonjs")
+        }
     }
 }

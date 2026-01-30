@@ -31,6 +31,70 @@ impl FileModuleLoader {
         Rc::new(self)
     }
 
+    /// Check if a module is CommonJS based on file extension and package.json "type" field
+    fn is_cjs_module(path: &Path) -> bool {
+        // 1. Check file extension first
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            match ext {
+                "cjs" => return true,   // Explicit CommonJS
+                "mjs" => return false,  // Explicit ESM
+                "json" => return false, // JSON is not CJS
+                _ => {}
+            }
+        }
+
+        // 2. Walk up to find nearest package.json and check "type" field
+        let mut current = path.parent();
+        while let Some(dir) = current {
+            let package_json = dir.join("package.json");
+            if package_json.exists() {
+                if let Ok(content) = std::fs::read_to_string(&package_json) {
+                    if let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&content) {
+                        // If type is "module", it's ESM; otherwise CJS
+                        return pkg.get("type").and_then(|t| t.as_str()) != Some("module");
+                    }
+                }
+                // Found package.json but no valid "type" field means CJS (default)
+                return true;
+            }
+            current = dir.parent();
+        }
+        // No package.json found, default to CJS
+        true
+    }
+
+    /// Wrap CommonJS code as ESM to provide synthetic default export
+    /// This enables ESM modules to import CJS modules with `import X from 'cjs-module'`
+    fn wrap_cjs_as_esm(code: &str, path: &Path) -> String {
+        let filename = path.to_string_lossy().replace('\\', "/");
+        let dirname = path.parent()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+
+        // Escape backticks and backslashes in the original code for template literal safety
+        let escaped_code = code
+            .replace('\\', "\\\\")
+            .replace('`', "\\`")
+            .replace("${", "\\${");
+
+        format!(r#"import {{ createRequire }} from "node:module";
+
+const __filename = "{}";
+const __dirname = "{}";
+const require = createRequire("file:///" + __filename.replace(/\\/g, "/"));
+
+const module = {{ exports: {{}} }};
+const exports = module.exports;
+
+(function(exports, require, module, __filename, __dirname) {{
+{}
+}})(exports, require, module, __filename, __dirname);
+
+export default module.exports;
+export {{ module }};
+"#, filename, dirname, code)
+    }
+
     /// Find the module in node_modules by walking up the directory tree
     fn find_in_node_modules(specifier: &str, start_dir: &Path) -> Option<PathBuf> {
         // Split the specifier into package name and subpath
@@ -262,6 +326,30 @@ impl ModuleLoader for FileModuleLoader {
             return ModuleSpecifier::parse(specifier).map_err(|e| JsErrorBox::from_err(e));
         }
 
+        // Check if this is a Node.js built-in module (without node: prefix)
+        // These need to be redirected to node: scheme
+        const NODE_BUILTINS: &[&str] = &[
+            "assert", "assert/strict", "async_hooks", "buffer", "child_process",
+            "cluster", "console", "constants", "crypto", "dgram", "diagnostics_channel",
+            "dns", "dns/promises", "domain", "events", "fs", "fs/promises", "http",
+            "http2", "https", "inspector", "inspector/promises", "module", "net",
+            "os", "path", "path/posix", "path/win32", "perf_hooks", "process",
+            "punycode", "querystring", "readline", "readline/promises", "repl",
+            "stream", "stream/consumers", "stream/promises", "stream/web",
+            "string_decoder", "sys", "timers", "timers/promises", "tls", "trace_events",
+            "tty", "url", "util", "util/types", "v8", "vm", "wasi", "worker_threads", "zlib",
+            // Internal modules that might be required
+            "_http_agent", "_http_client", "_http_common", "_http_incoming",
+            "_http_outgoing", "_http_server", "_stream_duplex", "_stream_passthrough",
+            "_stream_readable", "_stream_transform", "_stream_writable",
+            "_tls_common", "_tls_wrap",
+        ];
+
+        if NODE_BUILTINS.contains(&specifier) {
+            let node_specifier = format!("node:{}", specifier);
+            return ModuleSpecifier::parse(&node_specifier).map_err(|e| JsErrorBox::from_err(e));
+        }
+
         // For npm: specifiers
         if specifier.starts_with("npm:") {
             return ModuleSpecifier::parse(specifier).map_err(|e| JsErrorBox::from_err(e));
@@ -324,16 +412,22 @@ impl ModuleLoader for FileModuleLoader {
                 }
             };
 
-            // Determine module type based on extension
-            let module_type = if path.extension().map(|e| e == "json").unwrap_or(false) {
-                ModuleType::Json
+            // Determine module type and wrap CJS modules if needed
+            let (final_code, module_type) = if path.extension().map(|e| e == "json").unwrap_or(false) {
+                // JSON modules
+                (code, ModuleType::Json)
+            } else if Self::is_cjs_module(&path) {
+                // CJS module: wrap as ESM to provide synthetic default export
+                // This enables ESM modules to import CJS with `import X from 'cjs-module'`
+                (Self::wrap_cjs_as_esm(&code, &path), ModuleType::JavaScript)
             } else {
-                ModuleType::JavaScript
+                // ESM module: use as-is
+                (code, ModuleType::JavaScript)
             };
 
             return ModuleLoadResponse::Sync(Ok(ModuleSource::new(
                 module_type,
-                ModuleSourceCode::String(code.into()),
+                ModuleSourceCode::String(final_code.into()),
                 &specifier,
                 None,
             )));

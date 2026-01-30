@@ -65,7 +65,8 @@ class Context:
         enable_extensions: bool = True,
         enable_logging: bool = False,
         random_seed: Optional[int] = None,
-        enable_node_compat: bool = False  # Default False - only enable when you need require()
+        enable_node_compat: bool = False,  # Default False - only enable when you need require()
+        fast_return: bool = False  # 快速返回模式，函数return后立即返回不等待定时器
     ) -> None:
         """
         创建一个新的 JavaScript 执行上下文
@@ -86,6 +87,10 @@ class Context:
                                - True: 启用 require() 和 Node.js 内置模块
                                  可以加载 npm 包如 jsdom、lodash 等
                                - False: 不加载 Node.js 兼容层
+            fast_return: 快速返回模式，默认 False
+                        - True: 函数 return 后立即返回，不等待 setTimeout/setInterval
+                          适用于有定时器但只需要函数返回值的场景
+                        - False: 正常等待事件循环完成
 
         Example:
             >>> # 使用固定随机数种子
@@ -101,6 +106,12 @@ class Context:
             >>> ctx = Context(enable_node_compat=True)
             >>> ctx.evaluate("const path = require('path'); path.join('a', 'b')")
             'a/b'
+
+            >>> # 使用快速返回模式（适用于有定时器的JS代码）
+            >>> ctx = Context(fast_return=True)
+            >>> ctx.compile("setInterval(() => {}, 1000); function getData() { return 42; }")
+            >>> ctx.call("getData", [])  # 立即返回，不等待定时器
+            42
         """
         ...
 
@@ -419,7 +430,8 @@ class JSEngine:
         enable_extensions: bool = True,
         enable_node_compat: bool = False,
         enable_logging: bool = False,
-        random_seed: Optional[int] = None
+        random_seed: Optional[int] = None,
+        fast_return: bool = False  # 快速返回模式，函数return后立即返回不等待定时器
     ) -> None:
         """
         创建JavaScript引擎
@@ -437,6 +449,10 @@ class JSEngine:
                           开启后会输出Worker状态信息
             random_seed: 随机数种子（默认None）
                         用于确定性随机数生成
+            fast_return: 快速返回模式，默认 False
+                        - True: 函数 return 后立即返回，不等待 setTimeout/setInterval
+                          适用于有定时器但只需要函数返回值的场景
+                        - False: 正常等待事件循环完成
 
         Example:
             >>> # 基本用法
@@ -455,6 +471,14 @@ class JSEngine:
             ...         return _.uniq(arr);
             ...     }
             ... ''', enable_node_compat=True)
+            >>>
+            >>> # 使用快速返回模式（适用于有定时器的JS代码）
+            >>> engine = JSEngine('''
+            ...     setInterval(() => {}, 1000);
+            ...     function getData() { return 42; }
+            ... ''', fast_return=True)
+            >>> engine.call("getData", [])  # 立即返回，不等待定时器
+            42
         """
         ...
 

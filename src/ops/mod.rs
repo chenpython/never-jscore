@@ -8,4 +8,3 @@
 
 // Re-export storage_ops for backward compatibility
 pub mod storage_ops;
-pub use storage_ops::*;

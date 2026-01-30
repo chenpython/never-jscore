@@ -1,6 +1,6 @@
 [package]
 name = "never_jscore"
-version = "3.0.0"
+version = "3.1.0"
 edition = "2021"
 authors = ["never_jscore contributors"]
 description = "High-performance Python JavaScript execution engine based on Deno Core (V8) with full Promise/async support"
@@ -52,7 +52,7 @@ canvas = [
 ]
 
 [dependencies]
-deno_core = "0.376.0"
+deno_core = "0.380.1"
 
 
 deno_webidl = { path = "/home/deno/ext/webidl", optional = true }
@@ -68,12 +68,12 @@ deno_error = { version = "0.7.1", optional = true }
 sys_traits = { version = "0.1.17", features = ["libc", "real", "winapi"], optional = true }
 
 # Node.js 兼容层依赖（按 deno 为准）
-deno_node = { path = "/home/deno/ext/node", optional = true }
-deno_fs = { path = "/home/deno/ext/fs", optional = true }
-deno_io = { path = "/home/deno/ext/io", optional = true }
-deno_os = { path = "/home/deno/ext/os", optional = true }
-deno_process = { path = "/home/deno/ext/process", optional = true }
-node_resolver = { path = "/home/deno/libs/node_resolver", optional = true }
+deno_node = { path = "/home/deno/ext/node", optional = true, default-features = false  }
+deno_fs = { path = "/home/deno/ext/fs", optional = true, default-features = false  }
+deno_io = { path = "/home/deno/ext/io", optional = true, default-features = false  }
+deno_os = { path = "/home/deno/ext/os", optional = true, default-features = false  }
+deno_process = { path = "/home/deno/ext/process", optional = true, default-features = false  }
+node_resolver = { path = "/home/deno/libs/node_resolver", optional = true, default-features = false  }
 deno_semver = { version = "0.9.1", optional = true }
 deno_ast = { version = "0.50.3", features = ["transpiling"], optional = true }
 

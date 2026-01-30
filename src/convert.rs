@@ -73,11 +73,11 @@ pub fn json_to_python<'py>(py: Python<'py>, value: &JsonValue) -> PyResult<Bound
         }
         JsonValue::String(s) => Ok(s.into_bound_py_any(py)?),
         JsonValue::Array(arr) => {
-            let list = PyList::new(py, arr.iter().map(|_| py.None()).collect::<Vec<_>>())?;
-            for (i, item) in arr.iter().enumerate() {
-                list.set_item(i, json_to_python(py, item)?)?;
-            }
-            Ok(list.into_any())
+            // 优化：直接构建元素列表，避免双重迭代
+            let items: Result<Vec<_>, _> = arr.iter()
+                .map(|item| json_to_python(py, item))
+                .collect();
+            Ok(PyList::new(py, items?)?.into_any())
         }
         JsonValue::Object(obj) => {
             let dict = PyDict::new(py);

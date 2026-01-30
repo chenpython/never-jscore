@@ -1,7 +1,7 @@
 use deno_core::{extension, Extension, OpState};
 use super::ExtensionTrait;
 
-use crate::storage::{save_hook_data, save_hook_data_for_worker, WorkerId, get_hook_data, clear_hook_data};
+use crate::storage::{save_hook_data, save_hook_data_for_worker, WorkerId};
 
 /// Op: Save Hook intercepted data to global storage (new version, used with terminate_execution)
 ///

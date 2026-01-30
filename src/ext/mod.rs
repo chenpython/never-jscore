@@ -34,6 +34,10 @@ pub mod node_ops_stub;
 #[cfg(feature = "node_compat")]
 pub mod node_init;
 
+// Node.js bootstrap (creates __bootstrap.ext_node_* objects before deno_node loads)
+#[cfg(feature = "node_compat")]
+pub mod node_bootstrap;
+
 /// Trait for creating and configuring extensions
 /// Provides a unified interface for all extension types
 pub trait ExtensionTrait<Options> {
@@ -226,7 +230,8 @@ deno_core::extension!(
 /// Build all extensions based on feature flags and options
 /// This is the central function that orchestrates extension loading
 pub(crate) fn all_extensions(options: ExtensionOptions, is_snapshot: bool) -> Vec<Extension> {
-    let mut extensions = Vec::new();
+    // 预分配容量，避免多次重新分配（约 15-20 个扩展）
+    let mut extensions = Vec::with_capacity(20);
 
     // Core extensions (always included)
     extensions.extend(core::extensions(options.clone(), is_snapshot));

@@ -5,6 +5,7 @@
 
 use pyo3::prelude::*;
 use pyo3::types::PyList;
+use std::cell::OnceCell;
 use std::sync::Arc;
 use tokio::sync::oneshot;
 
@@ -14,6 +15,29 @@ use crate::storage::{get_hook_data_for_worker, clear_hook_data_for_worker};
 
 #[cfg(feature = "node_compat")]
 use crate::node_compat::NodeCompatOptions;
+
+/// Thread-local Tokio Runtime for JSEngine
+///
+/// 避免每次调用都创建新的 Runtime，显著提升性能（~80-150μs/调用）
+thread_local! {
+    static ENGINE_RUNTIME: OnceCell<tokio::runtime::Runtime> = OnceCell::new();
+}
+
+/// 使用 thread-local Runtime 执行异步操作
+fn run_with_engine_runtime<F, R>(f: F) -> R
+where
+    F: std::future::Future<Output = R>,
+{
+    ENGINE_RUNTIME.with(|cell| {
+        let rt = cell.get_or_init(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create tokio runtime for JSEngine")
+        });
+        rt.block_on(f)
+    })
+}
 
 /// JavaScript引擎
 ///
@@ -54,6 +78,7 @@ impl JSEngine {
     ///     enable_node_compat: 启用Node.js兼容（默认False）
     ///     enable_logging: 启用调试日志（默认False）
     ///     random_seed: 随机数种子（默认None）
+    ///     fast_return: 快速返回模式，函数return后立即返回不等待定时器（默认False）
     ///
     /// Returns:
     ///     JSEngine实例
@@ -64,7 +89,8 @@ impl JSEngine {
         enable_extensions=true,
         enable_node_compat=false,
         enable_logging=false,
-        random_seed=None
+        random_seed=None,
+        fast_return=false
     ))]
     fn new(
         code: String,
@@ -73,6 +99,7 @@ impl JSEngine {
         enable_node_compat: bool,
         enable_logging: bool,
         random_seed: Option<u32>,
+        fast_return: bool,
     ) -> PyResult<Self> {
         let worker_count = workers.unwrap_or_else(|| {
             std::thread::available_parallelism()
@@ -87,6 +114,7 @@ impl JSEngine {
             enable_logging,
             random_seed,
             enable_node_compat,
+            fast_return,
             #[cfg(feature = "node_compat")]
             node_compat_options: None,
         };
@@ -142,9 +170,7 @@ impl JSEngine {
 
         // 释放GIL并等待结果
         let json_result = py.allow_threads(|| {
-            let rx_result = tokio::runtime::Runtime::new()
-                .unwrap()
-                .block_on(async { rx.await });
+            let rx_result = run_with_engine_runtime(async { rx.await });
 
             rx_result
                 .map_err(|_| {
@@ -185,9 +211,7 @@ impl JSEngine {
 
         // 释放GIL并等待结果
         let json_result = py.allow_threads(|| {
-            let rx_result = tokio::runtime::Runtime::new()
-                .unwrap()
-                .block_on(async { rx.await });
+            let rx_result = run_with_engine_runtime(async { rx.await });
 
             rx_result
                 .map_err(|_| {

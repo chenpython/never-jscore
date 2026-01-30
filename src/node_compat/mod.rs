@@ -95,6 +95,11 @@ pub fn create_node_extensions(
     // Add IO stubs extension first (provides op_set_raw stub for deno_io)
     extensions.push(crate::ext::never_jscore_io_stubs::init());
 
+    // CRITICAL: Add bootstrap extension to create __bootstrap.ext_node_* objects
+    // before deno_node's 00_globals.js is loaded. This fixes the error:
+    // "Cannot read properties of undefined (reading 'nodeGlobals')"
+    extensions.push(crate::ext::node_bootstrap::init());
+
     // Add node ops stubs (provides missing ops like op_bootstrap_color_depth)
     extensions.push(crate::ext::node_ops_stub::never_jscore_node_ops::init());
 

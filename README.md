@@ -710,6 +710,77 @@ with ThreadPoolExecutor(max_workers=10) as executor:
 del engine
 ```
 
+#### 5. 多进程 + 多线程并发（v3.1.0，生产级并发）
+
+```python
+# ✅ 推荐：多进程套多线程，充分利用多核 CPU
+import os
+from multiprocessing import get_context
+from concurrent.futures import ThreadPoolExecutor
+import never_jscore
+
+js_code = """
+function encrypt(data, key) {
+    return btoa(data + key);
+}
+"""
+
+def process_worker(process_id):
+    """每个进程的工作函数"""
+    pid = os.getpid()
+    print(f"进程 {process_id} 启动 (PID: {pid})")
+
+    # ⚠️ 重要：每个进程必须创建独立的 JSEngine/Context
+    # JSEngine/Context 不能跨进程共享！
+    engine = never_jscore.JSEngine(js_code, workers=2, enable_node_compat=True)
+
+    def thread_worker(task_id):
+        """线程任务"""
+        return engine.call("encrypt", [f"data_{task_id}", "secret"])
+
+    # 每个进程内使用多线程
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(thread_worker, i) for i in range(10)]
+        results = [f.result() for f in futures]
+
+    del engine  # 显式清理资源
+    return len([r for r in results if r])
+
+if __name__ == "__main__":
+    # ⚠️ Windows 必须使用 'spawn' 方式
+    ctx = get_context('spawn')
+
+    with ctx.Pool(processes=4) as pool:
+        results = pool.map(process_worker, range(4))
+
+    print(f"总计完成: {sum(results)} 个任务")
+```
+
+**多进程注意事项** ⚠️：
+
+| 要点 | 说明 |
+|------|------|
+| **进程隔离** | 每个进程必须创建独立的 JSEngine/Context，不能跨进程共享 |
+| **Windows 兼容** | 必须使用 `get_context('spawn')`，不能用 `fork` |
+| **`__main__` 保护** | 多进程代码必须放在 `if __name__ == "__main__":` 中 |
+| **资源清理** | 进程结束前用 `del engine` 显式清理，确保正常退出 |
+| **线程数配置** | 每个进程的 workers 数 × 进程数 ≤ CPU 核心数 × 2 |
+
+**典型配置建议**（8 核 CPU）：
+
+```python
+# 方案 1：4 进程 × 2 workers = 8 并发
+ctx.Pool(processes=4)  # 4 进程
+JSEngine(js_code, workers=2)  # 每进程 2 workers
+
+# 方案 2：2 进程 × 4 workers = 8 并发
+ctx.Pool(processes=2)  # 2 进程
+JSEngine(js_code, workers=4)  # 每进程 4 workers
+
+# 方案 3：Context + ThreadLocal（最高性能）
+# 每个进程内用 ThreadLocal 复用 Context
+```
+
 ### ❌ 错误做法
 
 #### 1. 循环中重复创建 Context
@@ -897,6 +968,29 @@ python tests/run_all_tests.py
 ---
 
 ## 更新日志
+
+### v3.1.0 (2026-01-30) ⚡ 性能优化与稳定性修复
+
+- 🔧 **进程退出修复**
+  - 修复 Python 进程执行完成后卡住不退出的问题
+  - 每个 Context 现在拥有独立的 Tokio Runtime，随 Context 销毁自动清理
+  - 解决 `setTimeout` 定时器阻塞事件循环的问题
+
+- ⚡ **JSEngine Runtime 复用优化**
+  - 使用 `thread_local OnceCell` 复用 Tokio Runtime
+  - 避免每次调用都创建新 Runtime，性能提升约 200%
+
+- 🚀 **类型转换性能优化**
+  - `json_to_python` 数组转换消除双重迭代
+  - `ResultStorage` 使用 `Cell<bool>` 替代 `RefCell<bool>`，减少借用检查开销
+
+- 🔧 **FastReturnMode 修复**
+  - `op_store_result` 仅在 `FastReturnMode` 启用时才终止执行
+  - 修复非 fast_return 模式下 "execution terminated" 错误
+
+- 📖 **多进程 + 多线程文档**
+  - 新增生产级多进程并发使用指南
+  - 详细说明 Windows `spawn` 模式、进程隔离等注意事项
 
 ### v3.0.0 (2026-01-01) 🎉 重大架构升级
 

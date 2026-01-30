@@ -9,8 +9,6 @@ use std::rc::Rc;
 
 
 use crate::convert::{json_to_python, python_to_json};
-use crate::ops;
-use crate::runtime::run_with_tokio;
 use crate::storage::ResultStorage;
 
 #[cfg(feature = "deno_web_api")]
@@ -57,11 +55,17 @@ deno_core::extension!(
 #[pyclass(unsendable)]
 pub struct Context {
     runtime: RefCell<JsRuntime>,
+    /// 每个 Context 独立的 Tokio Runtime
+    ///
+    /// 这样 Context drop 时 runtime 也会被自动清理，
+    /// 所有后台任务（定时器、IO 等）会被终止，进程可以正常退出。
+    tokio_runtime: RefCell<tokio::runtime::Runtime>,
     result_storage: Rc<ResultStorage>,
     exec_count: RefCell<usize>,
     extensions_loaded: bool,
     logging_enabled: bool,
     random_seed: Option<u32>,  // Store seed for deferred initialization (for deno_crypto)
+    fast_return: bool,  // 快速返回模式，函数return后立即返回不等待定时器
 }
 
 
@@ -230,11 +234,13 @@ impl Context {
     /// * `enable_logging` - 是否启用操作日志输出
     /// * `random_seed` - 随机数种子（可选）。如果提供，所有随机数 API 将使用固定种子
     /// * `enable_node_compat` - 是否启用 Node.js 兼容层（require() 支持）
+    /// * `fast_return` - 快速返回模式，函数return后立即返回不等待定时器
     pub fn new(
         enable_extensions: bool,
         enable_logging: bool,
         random_seed: Option<u32>,
         enable_node_compat: bool,
+        fast_return: bool,
     ) -> PyResult<Self> {
         let storage = Rc::new(ResultStorage::new());
 
@@ -298,6 +304,9 @@ impl Context {
             let mut op_state_mut = op_state.borrow_mut();
             op_state_mut.put(isolate_handle);
 
+            // 添加 FastReturnMode 到 OpState
+            op_state_mut.put(crate::ext::core::FastReturnMode::new(fast_return));
+
             // 初始化 deno_web 需要的权限系统
             #[cfg(feature = "deno_web_api")]
             {
@@ -310,13 +319,24 @@ impl Context {
 
         // DON'T load polyfill here - defer to first execution to avoid isolate conflicts
 
+        // 创建独立的 Tokio Runtime
+        // 这样 Context drop 时 runtime 也会被自动清理，进程可以正常退出
+        let tokio_rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                format!("Failed to create tokio runtime: {}", e)
+            ))?;
+
         Ok(Context {
             runtime: RefCell::new(runtime),
+            tokio_runtime: RefCell::new(tokio_rt),
             result_storage: storage,
             exec_count: RefCell::new(0),
             extensions_loaded: enable_extensions,
             logging_enabled: enable_logging,
             random_seed,
+            fast_return,
         })
     }
 
@@ -421,32 +441,48 @@ impl Context {
         // RAII guard ensures isolate.exit() is always called, even on panic
         let _guard = IsolateGuard::new(self);
 
-        let mut runtime = self.runtime.borrow_mut();
-
         // Load extension init scripts on first execution
         let is_first_exec = *self.exec_count.borrow() == 0;
         if is_first_exec && self.extensions_loaded {
+            let mut runtime = self.runtime.borrow_mut();
             self.load_js_extensions(&mut runtime)?;
+            drop(runtime);
         }
 
-        // execute_script returns a v8::Global<v8::Value>
-        // We let it drop immediately
-        let _result = runtime
-            .execute_script("<exec>", code.to_string())
-            .map_err(|e| anyhow!("{}", format_error(e.into())))?;
-        // v8::Global drops here
+        // 整个执行过程都需要在 Tokio runtime 上下文中，因为 JS 代码可能注册定时器
+        let code_owned = code.to_string();
 
-        // 简化的定时器处理：只运行 event loop 来处理微任务
-        // 定时器通过 queueMicrotask 自动调度，依赖真实时间
-        drop(runtime);
+        // 使用 Context 自己的 tokio runtime，而不是全局的 thread_local runtime
+        // 这样 Context drop 时 runtime 也会被清理，进程可以正常退出
+        let tokio_rt = self.tokio_runtime.borrow();
+        tokio_rt.block_on(async {
+            let mut runtime = self.runtime.borrow_mut();
 
-        // 使用 Tokio 运行 event loop (处理 queueMicrotask 队列)
-        run_with_tokio(async {
-            let mut rt = self.runtime.borrow_mut();
+            // execute_script returns a v8::Global<v8::Value>
+            // We let it drop immediately
+            let _result = runtime
+                .execute_script("<exec>", code_owned)
+                .map_err(|e| anyhow!("{}", format_error(e.into())))?;
+            // v8::Global drops here
 
-            // 运行 event loop 直到微任务队列为空
-            rt.run_event_loop(Default::default()).await.ok();
-        });
+            // compile/exec_script 行为模拟 ExecJS：
+            // 只处理微任务队列，绝不等待定时器
+            // 这样 compile 时注册的 setTimeout/setInterval 不会阻塞
+            let waker = futures::task::noop_waker_ref();
+            let mut cx = std::task::Context::from_waker(waker);
+            // 多次 poll 以处理微任务队列（Promise 等）
+            for _ in 0..10 {
+                let _ = runtime.poll_event_loop(
+                    &mut cx,
+                    deno_core::PollEventLoopOptions {
+                        wait_for_inspector: false,
+                        pump_v8_message_loop: true,
+                    },
+                );
+            }
+
+            Ok::<(), anyhow::Error>(())
+        })?;
 
         // 更新执行计数
         let mut count = self.exec_count.borrow_mut();
@@ -489,7 +525,10 @@ impl Context {
 
         if auto_await {
             // 异步模式：自动等待 Promise
-            let result = run_with_tokio(async {
+            // 使用 Context 自己的 tokio runtime，而不是全局的 thread_local runtime
+            // 这样 Context drop 时 runtime 也会被清理，进程可以正常退出
+            let tokio_rt = self.tokio_runtime.borrow();
+            let result = tokio_rt.block_on(async {
                 let mut runtime = self.runtime.borrow_mut();
 
                 // 序列化代码
@@ -500,8 +539,32 @@ impl Context {
                 let wrapped_code = format!(
                     r#"
                     (async function() {{
+                        // 记录执行前的定时器 ID 基准
+                        const __timerBaseId = setTimeout(() => {{}}, 0);
+                        clearTimeout(__timerBaseId);
+
                         const code = {};
-                        const __result = await Promise.resolve(eval(code));
+                        let __result;
+                        let __error;
+
+                        try {{
+                            __result = await Promise.resolve(eval(code));
+                        }} catch(e) {{
+                            __error = e;
+                        }}
+
+                        // 清除所有定时器（包括 compile 期间创建的）
+                        const __timerEndId = setTimeout(() => {{}}, 0);
+                        clearTimeout(__timerEndId);
+                        for (let i = 0; i <= __timerEndId + 1000; i++) {{
+                            clearTimeout(i);
+                            clearInterval(i);
+                        }}
+
+                        // 如果有错误，重新抛出
+                        if (__error) {{
+                            throw __error;
+                        }}
 
                         if (__result === undefined) {{
                             __getDeno().core.ops.op_store_result("null");
@@ -538,11 +601,18 @@ impl Context {
                             return Ok(result);
                         }
 
-                        // ⚠️ 检查是否是 terminate_execution 错误
+                        // ⚠️ 检查是否是 terminate_execution 错误（fast_return 模式）
                         let error_msg = format!("{}", format_error(e.into()));
                         if error_msg.contains("execution terminated") {
                             // 恢复 isolate 状态，允许后续执行
                             runtime.v8_isolate().cancel_terminate_execution();
+
+                            // fast_return 模式：如果结果已存储，直接返回
+                            if let Some(result) = self.result_storage.take() {
+                                let mut count = self.exec_count.borrow_mut();
+                                *count += 1;
+                                return Ok(result);
+                            }
                         }
 
                         // 其他错误 - 格式化后返回
@@ -554,16 +624,20 @@ impl Context {
                     }
                 }
 
-                // 运行 event loop 等待 Promise 完成
-                let event_loop_result = runtime
-                    .run_event_loop(Default::default())
-                    .await;
+                // 使用 poll 循环代替 run_event_loop
+                // 这样可以在结果存储后立即返回，不被残留定时器阻塞
+                let mut last_error: Option<anyhow::Error> = None;
 
-                // 检查 event loop 是否遇到 EarlyReturnError
-                if let Err(e) = event_loop_result {
-                    // 检查是否是早期返回
+                loop {
+                    // 每次循环检查结果是否已存储
+                    if let Some(result) = self.result_storage.take() {
+                        let mut count = self.exec_count.borrow_mut();
+                        *count += 1;
+                        return Ok(result);
+                    }
+
+                    // 检查 early return 标志
                     if self.result_storage.is_early_return() {
-                        // Event loop 中的提前返回
                         let result = self.result_storage.take()
                             .ok_or_else(|| anyhow!("Early return but no result stored"))?;
                         let mut count = self.exec_count.borrow_mut();
@@ -571,28 +645,53 @@ impl Context {
                         return Ok(result);
                     }
 
-                    // ⚠️ 检查是否是 terminate_execution 错误
-                    let error_msg = format!("{}", format_error(e.into()));
-                    if error_msg.contains("execution terminated") {
-                        // 恢复 isolate 状态，允许后续执行
-                        runtime.v8_isolate().cancel_terminate_execution();
-                    }
+                    // Poll event loop 一次
+                    let poll_result = futures::future::poll_fn(|cx| {
+                        runtime.poll_event_loop(
+                            cx,
+                            deno_core::PollEventLoopOptions {
+                                wait_for_inspector: false,
+                                pump_v8_message_loop: true,
+                            },
+                        )
+                    }).await;
 
-                    // 其他错误 - 格式化后返回
-                    return Err(anyhow!("{}", error_msg));
+                    match poll_result {
+                        Ok(()) => {
+                            // Event loop 完成（没有更多任务）
+                            break;
+                        }
+                        Err(e) => {
+                            // 检查是否是 terminate_execution 错误
+                            let error_msg = format!("{}", format_error(e.into()));
+                            if error_msg.contains("execution terminated") {
+                                runtime.v8_isolate().cancel_terminate_execution();
+                                // 检查结果是否已存储
+                                if let Some(result) = self.result_storage.take() {
+                                    let mut count = self.exec_count.borrow_mut();
+                                    *count += 1;
+                                    return Ok(result);
+                                }
+                            }
+                            last_error = Some(anyhow!("{}", error_msg));
+                            break;
+                        }
+                    }
                 }
 
-                // 检查是否设置了 early return 标志（即使 event loop 正常完成）
-                // 这处理了 eval() 内部调用 __neverjscore_return__ 的情况
-                if self.result_storage.is_early_return() {
-                    let result = self.result_storage.take()
-                        .ok_or_else(|| anyhow!("Early return but no result stored"))?;
+                // 最后再检查一次结果
+                if let Some(result) = self.result_storage.take() {
                     let mut count = self.exec_count.borrow_mut();
                     *count += 1;
                     return Ok(result);
                 }
 
-                // 正常完成：从 result_storage 获取结果
+                // 如果有错误，返回错误
+                if let Some(e) = last_error {
+                    return Err(e);
+                }
+
+                // 正常完成但没有结果
                 let result = self
                     .result_storage
                     .take()
@@ -616,8 +715,33 @@ impl Context {
             let wrapped_code = format!(
                 r#"
                 (function() {{
+                    // 记录执行前的定时器 ID 基准
+                    const __timerBaseId = setTimeout(() => {{}}, 0);
+                    clearTimeout(__timerBaseId);
+
                     const code = {};
-                    const __result = eval(code);
+                    let __result;
+                    let __error;
+
+                    try {{
+                        __result = eval(code);
+                    }} catch(e) {{
+                        __error = e;
+                    }}
+
+                    // 清除所有定时器（包括 compile 期间创建的）
+                    const __timerEndId = setTimeout(() => {{}}, 0);
+                    clearTimeout(__timerEndId);
+                    for (let i = 0; i <= __timerEndId + 1000; i++) {{
+                        clearTimeout(i);
+                        clearInterval(i);
+                    }}
+
+                    // 如果有错误，重新抛出
+                    if (__error) {{
+                        throw __error;
+                    }}
+
                     if (__result === undefined) {{
                         __getDeno().core.ops.op_store_result("null");
                         return null;
@@ -771,17 +895,22 @@ impl Context {
     ///     # 另一个相同种子的上下文将产生相同的随机数序列
     ///     ctx_seeded2 = never_jscore.Context(random_seed=12345)
     ///     r3 = ctx_seeded2.evaluate("Math.random()")  # r3 == r1
+    ///
+    ///     # 创建快速返回模式的上下文（适用于有定时器的JS代码）
+    ///     ctx_fast = never_jscore.Context(fast_return=True)
+    ///     # 函数return后立即返回，不等待setTimeout/setInterval
     ///     ```
     #[new]
-    #[pyo3(signature = (enable_extensions=true, enable_logging=false, random_seed=None, enable_node_compat=false))]
+    #[pyo3(signature = (enable_extensions=true, enable_logging=false, random_seed=None, enable_node_compat=false, fast_return=false))]
     fn py_new(
         enable_extensions: bool,
         enable_logging: bool,
         random_seed: Option<u32>,
         enable_node_compat: bool,
+        fast_return: bool,
     ) -> PyResult<Self> {
         crate::runtime::ensure_v8_initialized();
-        Self::new(enable_extensions, enable_logging, random_seed, enable_node_compat)
+        Self::new(enable_extensions, enable_logging, random_seed, enable_node_compat, fast_return)
     }
 
     /// 编译JavaScript代码（便捷方法）

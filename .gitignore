@@ -27,7 +27,7 @@ wheels/
 .installed.cfg
 *.egg
 MANIFEST
-
+nul
 # PyO3/Maturin
 *.whl
 *.tar.gz

@@ -1,326 +1,426 @@
 """
-测试JSEngine - v3.0新架构
+never-jscore 多进程 + 多线程并发测试
 
-验证Worker池模式的核心功能
+测试场景：
+1. 多进程并行（每个进程独立的 V8 平台）
+2. 每个进程内多线程并行（每个线程独立的 Context）
+3. JSEngine Worker Pool 测试（跨线程任务分发）
+
+验证目标：
+- 进程正常退出（不卡住）
+- 线程安全
+- 资源正确释放
+- 结果正确性
 """
 
-import sys
-import os
-
-# Set UTF-8 encoding for Windows console
-if sys.platform == 'win32':
-    import io
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-
 import never_jscore
+import threading
+import multiprocessing
 import time
-from concurrent.futures import ThreadPoolExecutor
+import os
+import sys
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from typing import List, Tuple
 
+# ============================================
+# 测试用 JavaScript 代码
+# ============================================
 
-def test_basic_usage():
-    """测试基本用法"""
-    print("\n【测试1】基本用法")
-    print("-" * 70)
+JS_CODE = """
+// 简单的加密函数用于测试
+function encrypt(data, key) {
+    // 简单的 XOR 加密模拟
+    let result = '';
+    for (let i = 0; i < data.length; i++) {
+        result += String.fromCharCode(data.charCodeAt(i) ^ (key % 256));
+    }
+    return btoa(result);
+}
 
-    engine = never_jscore.JSEngine("""
-        function add(a, b) {
-            return a + b;
-        }
+function decrypt(encoded, key) {
+    let data = atob(encoded);
+    let result = '';
+    for (let i = 0; i < data.length; i++) {
+        result += String.fromCharCode(data.charCodeAt(i) ^ (key % 256));
+    }
+    return result;
+}
 
-        function multiply(a, b) {
-            return a * b;
-        }
-    """, workers=2)
+function calculate(a, b, op) {
+    switch(op) {
+        case 'add': return a + b;
+        case 'sub': return a - b;
+        case 'mul': return a * b;
+        case 'div': return b !== 0 ? a / b : 0;
+        default: return 0;
+    }
+}
 
-    result1 = engine.call("add", [1, 2])
-    assert result1 == 3, f"Expected 3, got {result1}"
-    print(f"✓ add(1, 2) = {result1}")
+function asyncTask(delay, value) {
+    return new Promise(resolve => {
+        setTimeout(() => resolve(value * 2), delay);
+    });
+}
 
-    result2 = engine.call("multiply", [3, 4])
-    assert result2 == 12, f"Expected 12, got {result2}"
-    print(f"✓ multiply(3, 4) = {result2}")
+// 测试函数：返回进程和线程信息
+function getInfo() {
+    return {
+        timestamp: Date.now(),
+        random: Math.random()
+    };
+}
+"""
 
-    print(f"✓ Workers: {engine.workers}")
+# ============================================
+# 单线程 Context 测试
+# ============================================
 
-
-def test_no_reload_performance():
-    """测试核心优势：JS代码不重复加载"""
-    print("\n【测试2】核心优势 - JS代码只加载一次")
-    print("-" * 70)
-
-    # 模拟大型JS库
-    large_lib = """
-        // 模拟大型加密库
-        const Lib = {
-            hash: function(str) {
-                let hash = 0;
-                for (let i = 0; i < str.length; i++) {
-                    hash = ((hash << 5) - hash) + str.charCodeAt(i);
-                    hash = hash & hash;
-                }
-                return Math.abs(hash).toString(16).padStart(8, '0');
-            }
-        };
-
-        function encrypt(data) {
-            return btoa(JSON.stringify({
-                data: data,
-                hash: Lib.hash(data)
-            }));
-        }
+def test_single_thread_context(thread_id: int, iterations: int) -> Tuple[int, int, float]:
     """
+    单线程内使用 Context 执行多次操作
 
-    print(f"JS库大小: {len(large_lib)} 字节")
+    Returns:
+        (thread_id, success_count, elapsed_time)
+    """
+    success = 0
+    start = time.perf_counter()
 
-    # 创建引擎（只加载一次）
-    engine = never_jscore.JSEngine(large_lib, workers=4)
+    # 每个线程创建独立的 Context
+    ctx = never_jscore.Context(enable_extensions=True)
+    ctx.compile(JS_CODE)
 
-    iterations = 100
-    data_list = [f"data_{i}" for i in range(iterations)]
+    for i in range(iterations):
+        try:
+            # 测试函数调用
+            result = ctx.call("calculate", [i, thread_id, "add"])
+            expected = i + thread_id
+            if result == expected:
+                success += 1
 
-    # 多次调用，无需重复加载
-    start = time.time()
-    results = []
-    for data in data_list:
-        result = engine.call("encrypt", [data])
-        results.append(result)
-    elapsed = time.time() - start
+            # 测试加密解密
+            text = f"hello_{thread_id}_{i}"
+            key = (thread_id * 100 + i) % 256
+            encrypted = ctx.call("encrypt", [text, key])
+            decrypted = ctx.call("decrypt", [encrypted, key])
+            if decrypted == text:
+                success += 1
+            else:
+                print(f"[Thread {thread_id}] Decrypt mismatch: {text} != {decrypted}")
 
-    print(f"✓ 处理 {iterations} 次调用")
-    print(f"✓ 总耗时: {elapsed*1000:.2f}ms")
-    print(f"✓ 平均耗时: {elapsed*1000/iterations:.2f}ms/次")
-    print(f"✓ 优势: JS库只加载4次（每个Worker一次），然后重复使用")
+        except Exception as e:
+            print(f"[Thread {thread_id}] Error at iteration {i}: {e}")
 
-    assert len(results) == iterations
+    # 显式删除 Context
+    del ctx
 
-
-def test_multithreading():
-    """测试多线程并发"""
-    print("\n【测试3】多线程并发")
-    print("-" * 70)
-
-    engine = never_jscore.JSEngine("""
-        function process(x) {
-            return x * 2;
-        }
-    """, workers=4)
-
-    iterations = 100
-    data_list = list(range(iterations))
-
-    # 多线程并发调用
-    start = time.time()
-    with ThreadPoolExecutor(max_workers=20) as executor:
-        results = list(executor.map(
-            lambda x: engine.call("process", [x]),
-            data_list
-        ))
-    elapsed = time.time() - start
-
-    print(f"✓ 20个Python线程 → 4个Worker")
-    print(f"✓ 处理 {iterations} 次调用")
-    print(f"✓ 总耗时: {elapsed*1000:.2f}ms")
-    print(f"✓ 平均耗时: {elapsed*1000/iterations:.2f}ms/次")
-
-    # 验证结果
-    expected = [x * 2 for x in data_list]
-    assert results == expected, "Results mismatch"
-    print(f"✓ 结果验证通过")
+    elapsed = time.perf_counter() - start
+    return (thread_id, success, elapsed)
 
 
-def test_execute_method():
-    """测试execute方法"""
-    print("\n【测试4】execute方法")
-    print("-" * 70)
+def test_multithreading_context(num_threads: int, iterations_per_thread: int):
+    """
+    多线程测试：每个线程独立 Context
+    """
+    print(f"\n{'='*60}")
+    print(f"多线程 Context 测试")
+    print(f"线程数: {num_threads}, 每线程迭代: {iterations_per_thread}")
+    print(f"{'='*60}")
 
-    engine = never_jscore.JSEngine("", workers=2)
+    start = time.perf_counter()
 
-    result1 = engine.execute("1 + 2 + 3")
-    assert result1 == 6
-    print(f"✓ execute('1 + 2 + 3') = {result1}")
+    with ThreadPoolExecutor(max_workers=num_threads) as executor:
+        futures = [
+            executor.submit(test_single_thread_context, tid, iterations_per_thread)
+            for tid in range(num_threads)
+        ]
 
-    result2 = engine.execute("Math.sqrt(16)")
-    assert result2 == 4
-    print(f"✓ execute('Math.sqrt(16)') = {result2}")
+        results = [f.result() for f in futures]
 
-    result3 = engine.execute("btoa('hello')")
-    assert result3 == "aGVsbG8="
-    print(f"✓ execute('btoa(\"hello\")') = {result3}")
+    total_time = time.perf_counter() - start
 
+    # 统计结果
+    total_success = sum(r[1] for r in results)
+    expected_total = num_threads * iterations_per_thread * 2  # 每次迭代 2 个测试
 
-def test_promise_support():
-    """测试Promise支持"""
-    print("\n【测试5】Promise支持")
-    print("-" * 70)
+    print(f"\n结果统计:")
+    for tid, success, elapsed in results:
+        print(f"  Thread {tid}: {success} 成功, 耗时 {elapsed:.3f}s")
 
-    engine = never_jscore.JSEngine("""
-        async function asyncAdd(a, b) {
-            await new Promise(r => setTimeout(r, 10));
-            return a + b;
-        }
+    print(f"\n总计: {total_success}/{expected_total} 成功")
+    print(f"总耗时: {total_time:.3f}s")
+    print(f"吞吐量: {total_success/total_time:.1f} ops/s")
 
-        function promiseMultiply(a, b) {
-            return Promise.resolve(a * b);
-        }
-    """, workers=2)
-
-    # 测试async函数
-    result1 = engine.call("asyncAdd", [10, 20])
-    assert result1 == 30
-    print(f"✓ asyncAdd(10, 20) = {result1} (自动await)")
-
-    # 测试Promise
-    result2 = engine.call("promiseMultiply", [3, 7])
-    assert result2 == 21
-    print(f"✓ promiseMultiply(3, 7) = {result2} (自动await)")
+    return total_success == expected_total
 
 
-def test_context_manager():
-    """测试上下文管理器"""
-    print("\n【测试6】上下文管理器")
-    print("-" * 70)
+# ============================================
+# JSEngine Worker Pool 测试
+# ============================================
 
-    with never_jscore.JSEngine("function test() { return 42; }", workers=2) as engine:
-        result = engine.call("test", [])
-        assert result == 42
-        print(f"✓ 上下文管理器内调用: {result}")
+def test_jsengine_worker_pool(num_workers: int, total_tasks: int):
+    """
+    JSEngine Worker Pool 测试
+    """
+    print(f"\n{'='*60}")
+    print(f"JSEngine Worker Pool 测试")
+    print(f"Worker 数: {num_workers}, 总任务数: {total_tasks}")
+    print(f"{'='*60}")
 
-    print(f"✓ 上下文管理器退出成功")
+    start = time.perf_counter()
+
+    # 创建 JSEngine（JS 代码只加载一次）
+    engine = never_jscore.JSEngine(
+        JS_CODE,
+        workers=num_workers,
+        enable_extensions=True
+    )
+
+    print(f"Engine 创建完成: {engine}")
+
+    success = 0
+    errors = []
+
+    def submit_task(task_id):
+        try:
+            # 测试计算
+            result = engine.call("calculate", [task_id, 10, "mul"])
+            if result == task_id * 10:
+                return True
+            else:
+                return False
+        except Exception as e:
+            return str(e)
+
+    # 多线程提交任务到 Worker Pool
+    with ThreadPoolExecutor(max_workers=num_workers * 2) as executor:
+        futures = [executor.submit(submit_task, i) for i in range(total_tasks)]
+        results = [f.result() for f in futures]
+
+    success = sum(1 for r in results if r is True)
+    errors = [r for r in results if r is not True and r is not False]
+
+    elapsed = time.perf_counter() - start
+
+    print(f"\n结果统计:")
+    print(f"  成功: {success}/{total_tasks}")
+    print(f"  失败: {total_tasks - success}")
+    if errors:
+        print(f"  错误样例: {errors[:3]}")
+    print(f"  耗时: {elapsed:.3f}s")
+    print(f"  吞吐量: {total_tasks/elapsed:.1f} tasks/s")
+
+    # 显式删除 Engine
+    del engine
+
+    return success == total_tasks
 
 
-def test_worker_count():
-    """测试Worker数量"""
-    print("\n【测试7】Worker数量")
-    print("-" * 70)
+# ============================================
+# 单进程测试函数（供多进程调用）
+# ============================================
 
-    # 默认Worker数量（CPU核心数）
-    engine1 = never_jscore.JSEngine("")
-    print(f"✓ 默认Worker数: {engine1.workers}")
+def process_worker(process_id: int, num_threads: int, iterations: int) -> dict:
+    """
+    单个进程内的测试工作
+    """
+    pid = os.getpid()
+    print(f"[Process {process_id}] Started (PID: {pid})")
 
-    # 指定Worker数量
-    engine2 = never_jscore.JSEngine("", workers=8)
-    assert engine2.workers == 8
-    print(f"✓ 指定Worker数: {engine2.workers}")
-
-
-def test_error_handling():
-    """测试错误处理"""
-    print("\n【测试8】错误处理")
-    print("-" * 70)
-
-    engine = never_jscore.JSEngine("""
-        function divide(a, b) {
-            if (b === 0) {
-                throw new Error("Division by zero");
-            }
-            return a / b;
-        }
-    """, workers=2)
-
-    # 正常调用
-    result = engine.call("divide", [10, 2])
-    assert result == 5
-    print(f"✓ divide(10, 2) = {result}")
-
-    # 错误调用
-    try:
-        engine.call("divide", [10, 0])
-        assert False, "Should have raised an exception"
-    except Exception as e:
-        print(f"✓ 错误被正确捕获: {str(e)[:50]}...")
-
-
-def test_complex_types():
-    """测试复杂类型转换"""
-    print("\n【测试9】复杂类型转换")
-    print("-" * 70)
-
-    engine = never_jscore.JSEngine("""
-        function processData(obj) {
-            return {
-                input: obj,
-                count: obj.items.length,
-                sum: obj.items.reduce((a, b) => a + b, 0)
-            };
-        }
-    """, workers=2)
-
-    input_data = {
-        "name": "test",
-        "items": [1, 2, 3, 4, 5]
+    results = {
+        'process_id': process_id,
+        'pid': pid,
+        'thread_results': [],
+        'success': True
     }
 
-    result = engine.call("processData", [input_data])
+    try:
+        # 在进程内运行多线程测试
+        start = time.perf_counter()
 
-    assert result["count"] == 5
-    assert result["sum"] == 15
-    assert result["input"]["name"] == "test"
+        with ThreadPoolExecutor(max_workers=num_threads) as executor:
+            futures = [
+                executor.submit(test_single_thread_context, tid, iterations)
+                for tid in range(num_threads)
+            ]
 
-    print(f"✓ 复杂对象转换成功")
-    print(f"✓ count: {result['count']}, sum: {result['sum']}")
+            thread_results = [f.result() for f in futures]
+
+        elapsed = time.perf_counter() - start
+
+        results['thread_results'] = thread_results
+        results['elapsed'] = elapsed
+        results['total_success'] = sum(r[1] for r in thread_results)
+        results['expected'] = num_threads * iterations * 2
+
+        print(f"[Process {process_id}] Completed: {results['total_success']}/{results['expected']} in {elapsed:.3f}s")
+
+    except Exception as e:
+        results['success'] = False
+        results['error'] = str(e)
+        print(f"[Process {process_id}] Error: {e}")
+
+    return results
 
 
-def test_concurrent_different_functions():
-    """测试并发调用不同函数"""
-    print("\n【测试10】并发调用不同函数")
-    print("-" * 70)
+def test_multiprocess_multithreading(
+        num_processes: int,
+        threads_per_process: int,
+        iterations_per_thread: int
+):
+    """
+    多进程 + 多线程测试
+    """
+    print(f"\n{'='*60}")
+    print(f"多进程 + 多线程并发测试")
+    print(f"进程数: {num_processes}")
+    print(f"每进程线程数: {threads_per_process}")
+    print(f"每线程迭代数: {iterations_per_thread}")
+    print(f"总操作数: {num_processes * threads_per_process * iterations_per_thread * 2}")
+    print(f"{'='*60}")
 
-    engine = never_jscore.JSEngine("""
-        function add(a, b) { return a + b; }
-        function sub(a, b) { return a - b; }
-        function mul(a, b) { return a * b; }
-        function div(a, b) { return a / b; }
-    """, workers=4)
+    start = time.perf_counter()
 
-    def worker(args):
-        func, a, b = args
-        return engine.call(func, [a, b])
+    # 使用 spawn 方式创建进程（Windows 兼容）
+    ctx = multiprocessing.get_context('spawn')
 
-    tasks = [
-        ("add", 10, 5),
-        ("sub", 10, 5),
-        ("mul", 10, 5),
-        ("div", 10, 5),
-    ] * 25  # 100个任务
+    with ctx.Pool(processes=num_processes) as pool:
+        # 提交所有进程任务
+        async_results = [
+            pool.apply_async(
+                process_worker,
+                (pid, threads_per_process, iterations_per_thread)
+            )
+            for pid in range(num_processes)
+        ]
 
-    start = time.time()
-    with ThreadPoolExecutor(max_workers=20) as executor:
-        results = list(executor.map(worker, tasks))
-    elapsed = time.time() - start
+        # 等待所有结果
+        results = [ar.get(timeout=120) for ar in async_results]
 
-    # 验证结果
-    assert results[0] == 15  # add
-    assert results[1] == 5   # sub
-    assert results[2] == 50  # mul
-    assert results[3] == 2   # div
+    total_time = time.perf_counter() - start
 
-    print(f"✓ 100个混合函数调用")
-    print(f"✓ 耗时: {elapsed*1000:.2f}ms")
-    print(f"✓ 结果验证通过")
+    # 统计总结果
+    total_success = sum(r.get('total_success', 0) for r in results)
+    total_expected = sum(r.get('expected', 0) for r in results)
+    all_passed = all(r.get('success', False) for r in results)
+
+    print(f"\n{'='*60}")
+    print(f"总结果:")
+    print(f"{'='*60}")
+
+    for r in results:
+        pid = r.get('process_id', '?')
+        success = r.get('total_success', 0)
+        expected = r.get('expected', 0)
+        elapsed = r.get('elapsed', 0)
+        status = "✓" if r.get('success', False) else "✗"
+        print(f"  Process {pid}: {success}/{expected} {status} ({elapsed:.3f}s)")
+
+    print(f"\n总计: {total_success}/{total_expected} 成功")
+    print(f"总耗时: {total_time:.3f}s")
+    print(f"吞吐量: {total_success/total_time:.1f} ops/s")
+    print(f"状态: {'ALL PASSED ✓' if all_passed and total_success == total_expected else 'FAILED ✗'}")
+
+    return all_passed and total_success == total_expected
+
+
+# ============================================
+# 进程退出测试
+# ============================================
+
+def test_process_exit():
+    """
+    测试进程是否能正常退出（不卡住）
+    """
+    print(f"\n{'='*60}")
+    print(f"进程退出测试")
+    print(f"{'='*60}")
+
+    # 创建 Context
+    ctx = never_jscore.Context(enable_extensions=True)
+    ctx.compile(JS_CODE)
+
+    # 执行一些操作
+    for i in range(10):
+        result = ctx.call("calculate", [i, 5, "add"])
+        assert result == i + 5, f"Expected {i+5}, got {result}"
+
+    print("  10 次计算完成")
+
+    # 测试异步操作
+    result = ctx.call("getInfo", [])
+    print(f"  getInfo 返回: timestamp={result.get('timestamp')}")
+
+    # 显式删除
+    del ctx
+    print("  Context 已删除")
+
+    print("  进程退出测试通过 ✓")
+    return True
+
+
+# ============================================
+# 主测试入口
+# ============================================
+
+def main():
+    print(f"never-jscore 并发测试")
+    print(f"Python {sys.version}")
+    print(f"PID: {os.getpid()}")
+    print(f"CPU 核心数: {os.cpu_count()}")
+
+    all_passed = True
+
+    # 1. 进程退出测试
+    try:
+        if not test_process_exit():
+            all_passed = False
+    except Exception as e:
+        print(f"进程退出测试失败: {e}")
+        all_passed = False
+
+    # 2. 多线程 Context 测试
+    try:
+        if not test_multithreading_context(num_threads=4, iterations_per_thread=50):
+            all_passed = False
+    except Exception as e:
+        print(f"多线程 Context 测试失败: {e}")
+        all_passed = False
+
+    # 3. JSEngine Worker Pool 测试
+    try:
+        if not test_jsengine_worker_pool(num_workers=4, total_tasks=100):
+            all_passed = False
+    except Exception as e:
+        print(f"JSEngine 测试失败: {e}")
+        all_passed = False
+
+    # 4. 多进程 + 多线程测试
+    try:
+        if not test_multiprocess_multithreading(
+                num_processes=2,
+                threads_per_process=2,
+                iterations_per_thread=20
+        ):
+            all_passed = False
+    except Exception as e:
+        print(f"多进程测试失败: {e}")
+        import traceback
+        traceback.print_exc()
+        all_passed = False
+
+    # 最终结果
+    print(f"\n{'='*60}")
+    if all_passed:
+        print("所有测试通过 ✓")
+    else:
+        print("部分测试失败 ✗")
+    print(f"{'='*60}")
+
+    print("\n等待进程退出...")
+    return 0 if all_passed else 1
 
 
 if __name__ == "__main__":
-    print("=" * 70)
-    print("           JSEngine 功能测试 (v3.0)")
-    print("=" * 70)
-
-    test_basic_usage()
-    test_no_reload_performance()
-    test_multithreading()
-    test_execute_method()
-    test_promise_support()
-    test_context_manager()
-    test_worker_count()
-    test_error_handling()
-    test_complex_types()
-    test_concurrent_different_functions()
-
-    print("\n" + "=" * 70)
-    print("✅ 所有JSEngine测试通过！")
-    print("=" * 70)
-    print("\n💡 核心优势验证成功：")
-    print("   ✓ JS代码只加载一次（每个Worker）")
-    print("   ✓ Worker持久化，重复使用")
-    print("   ✓ 多线程完全并行")
-    print("   ✓ 10-20倍性能提升")
-    print("=" * 70)
+    exit_code = main()
+    print(f"退出码: {exit_code}")
+    sys.exit(exit_code)

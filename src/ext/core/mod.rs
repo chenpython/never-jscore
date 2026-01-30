@@ -1,17 +1,51 @@
-use deno_core::{extension, OpState, Extension};
+use deno_core::{extension, OpState, Extension, v8};
 use std::rc::Rc;
+use std::cell::Cell;
 
 use super::ExtensionTrait;
 use crate::storage::ResultStorage;
 
+/// 快速返回模式标志
+/// 当启用时，op_store_result 会在存储结果后立即终止 V8 执行
+/// 这对于有 setInterval/setTimeout 的 JS 代码很有用，避免等待定时器
+pub struct FastReturnMode(pub Cell<bool>);
+
+impl FastReturnMode {
+    pub fn new(enabled: bool) -> Self {
+        Self(Cell::new(enabled))
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.0.get()
+    }
+
+    pub fn set(&self, enabled: bool) {
+        self.0.set(enabled);
+    }
+}
+
 /// Op: Store JavaScript execution result
 ///
 /// This op allows JavaScript code to store execution results to Rust side.
-/// Uses #[op2(fast)] for performance optimization.
+/// When FastReturnMode is enabled, it will also terminate V8 execution to
+/// immediately return to Rust, preventing timers from blocking.
 #[deno_core::op2(fast)]
 pub fn op_store_result(state: &mut OpState, #[string] value: String) {
     if let Some(storage) = state.try_borrow_mut::<Rc<ResultStorage>>() {
         storage.store(value);
+    }
+
+    // 只有在 FastReturnMode 启用时才终止执行
+    // 这样可以确保定时器不会阻塞程序返回
+    let should_terminate = state
+        .try_borrow::<FastReturnMode>()
+        .map(|mode| mode.is_enabled())
+        .unwrap_or(false);
+
+    if should_terminate {
+        if let Some(handle) = state.try_borrow::<v8::IsolateHandle>() {
+            handle.terminate_execution();
+        }
     }
 }
 

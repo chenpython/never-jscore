@@ -61,6 +61,9 @@ pub struct WorkerPoolConfig {
     pub random_seed: Option<u32>,
     /// 启用Node.js兼容
     pub enable_node_compat: bool,
+    /// 快速返回模式：函数return后立即返回，不等待定时器
+    /// 对于有setInterval/setTimeout的JS代码很有用
+    pub fast_return: bool,
     /// Node.js兼容选项
     #[cfg(feature = "node_compat")]
     pub node_compat_options: Option<NodeCompatOptions>,
@@ -77,6 +80,7 @@ impl Default for WorkerPoolConfig {
             enable_logging: false,
             random_seed: None,
             enable_node_compat: false,
+            fast_return: false,  // 默认关闭，保持原有行为
             #[cfg(feature = "node_compat")]
             node_compat_options: None,
         }
@@ -252,14 +256,44 @@ async fn create_and_init_runtime(
     // 获取所有extensions
     let extensions = all_extensions(ext_options, false);
 
+    // Configure extension transpiler for TypeScript (node_compat feature)
+    #[cfg(feature = "node_compat")]
+    let extension_transpiler: Option<std::rc::Rc<dyn Fn(deno_core::ModuleName, deno_core::ModuleCodeString) -> Result<(deno_core::ModuleCodeString, Option<deno_core::SourceMapData>), deno_error::JsErrorBox>>> =
+        if config.enable_node_compat {
+            Some(std::rc::Rc::new(crate::transpile::maybe_transpile_source))
+        } else {
+            None
+        };
+
+    #[cfg(not(feature = "node_compat"))]
+    let extension_transpiler: Option<std::rc::Rc<dyn Fn(deno_core::ModuleName, deno_core::ModuleCodeString) -> Result<(deno_core::ModuleCodeString, Option<deno_core::SourceMapData>), deno_error::JsErrorBox>>> = None;
+
+    // Create module loader for ESM support
+    #[cfg(feature = "node_compat")]
+    let module_loader: std::rc::Rc<dyn deno_core::ModuleLoader> = if config.enable_node_compat {
+        crate::module_loader::FileModuleLoader::new().into_rc()
+    } else {
+        std::rc::Rc::new(deno_core::NoopModuleLoader)
+    };
+
+    #[cfg(not(feature = "node_compat"))]
+    let module_loader: std::rc::Rc<dyn deno_core::ModuleLoader> = std::rc::Rc::new(deno_core::NoopModuleLoader);
+
     // 创建RuntimeOptions
     let runtime_options = RuntimeOptions {
         extensions,
+        extension_transpiler,
+        module_loader: Some(module_loader),
         ..Default::default()
     };
 
     // 创建JsRuntime
     let mut runtime = JsRuntime::new(runtime_options);
+
+    // NOTE: __bootstrap.ext_node_nodeGlobals and ext_node_denoGlobals are now
+    // initialized by the node_bootstrap extension's global_object_middleware,
+    // which runs during JsRuntime::new() BEFORE ESM modules are loaded.
+    // See src/ext/node_bootstrap.rs for the implementation.
 
     // 将 IsolateHandle 和 worker_id 存入 OpState
     {
@@ -268,6 +302,15 @@ async fn create_and_init_runtime(
         let mut op_state_mut = op_state.borrow_mut();
         op_state_mut.put(isolate_handle);  // 供 op_terminate_execution 使用
         op_state_mut.put(WorkerId(worker_id));  // 供 op_save_hook_data 使用
+
+        // 设置快速返回模式
+        op_state_mut.put(crate::ext::core::FastReturnMode::new(config.fast_return));
+
+        // 初始化 deno_web 需要的权限系统
+        #[cfg(feature = "deno_web_api")]
+        {
+            op_state_mut.put(crate::permissions::create_allow_all_permissions());
+        }
     }
 
     // 加载扩展的 JavaScript 初始化代码（$terminate 等函数）
@@ -304,14 +347,22 @@ async fn create_and_init_runtime(
             .execute_script("<pool_init>", init_code.clone())
             .map_err(|e| format!("Init code error: {}", e))?;
 
-        // 运行微任务（compile模式，不等待宏任务）
-        runtime
-            .run_event_loop(PollEventLoopOptions {
-                wait_for_inspector: false,
-                pump_v8_message_loop: true,
-            })
-            .await
-            .map_err(|e| format!("Event loop error during init: {}", e))?;
+        // 初始化阶段：只处理微任务，不等待宏任务（定时器等）
+        // 使用 poll 模式快速处理 Promise，但不阻塞等待定时器
+        {
+            let waker = futures::task::noop_waker_ref();
+            let mut cx = std::task::Context::from_waker(waker);
+            // 多次 poll 以处理微任务队列
+            for _ in 0..10 {
+                let _ = runtime.poll_event_loop(
+                    &mut cx,
+                    PollEventLoopOptions {
+                        wait_for_inspector: false,
+                        pump_v8_message_loop: true,
+                    },
+                );
+            }
+        }
 
         if config.enable_logging {
             eprintln!("[Worker {}] Init code loaded successfully", worker_id);
@@ -407,43 +458,34 @@ async fn execute_task(
                 }
             }
 
-            // 运行完整事件循环（等待Promise和setTimeout）
+            // 运行事件循环 - op_store_result 会在结果存储后自动终止执行
+            // 这样即使有定时器，函数 return 后也会立即返回
             let event_loop_result = runtime
                 .run_event_loop(PollEventLoopOptions::default())
                 .await;
 
+            // 检查事件循环结果
             if let Err(e) = event_loop_result {
-                // 检查 event loop 中的 terminate_execution 错误
                 let error_msg = format!("Event loop error: {}", e);
                 if error_msg.contains("execution terminated") {
-                    // 恢复 isolate 状态
+                    // 正常情况：op_store_result 触发的终止，恢复 isolate 状态
                     runtime.v8_isolate().cancel_terminate_execution();
 
-                    if config.enable_logging {
-                        eprintln!("[Worker {}] Event loop terminated (hook), isolate recovered", worker_id);
-                    }
-
-                    // 检查是否有 hook data
+                    // 检查是否有 hook data（$terminate 场景）
                     if let Some(hook_data) = get_hook_data_for_worker(worker_id) {
-                        // 立即清空
                         clear_hook_data_for_worker(worker_id);
-
-                        if config.enable_logging {
-                            eprintln!("[Worker {}] Hook data from event loop, returning with data", worker_id);
-                        }
-
-                        // 直接返回 hook data
                         let hook_json: JsonValue = serde_json::from_str(&hook_data)
                             .map_err(|e| format!("Failed to parse hook data: {}", e))?;
-
                         return Ok(serde_json::json!({
                             "__hook__": true,
                             "worker_id": worker_id,
                             "data": hook_json
                         }));
                     }
+                    // 不是 hook，是正常的结果返回终止，继续获取结果
+                } else {
+                    return Err(error_msg);
                 }
-                return Err(error_msg);
             }
 
             // 从 storage 获取结果
@@ -498,81 +540,63 @@ async fn execute_task(
 
             match execute_result {
                 Err(e) => {
-                    // 检查是否是 terminate_execution 错误（hook场景）
+                    // 检查是否是 terminate_execution 错误（hook场景或结果返回）
                     let error_msg = format_js_error(*e);
                     if error_msg.contains("execution terminated") {
                         // 恢复 isolate 状态，允许 Worker 继续处理后续任务
                         runtime.v8_isolate().cancel_terminate_execution();
 
-                        if config.enable_logging {
-                            eprintln!("[Worker {}] Function call terminated (hook), isolate recovered", worker_id);
-                        }
-
                         // 检查是否有 hook data
                         if let Some(hook_data) = get_hook_data_for_worker(worker_id) {
-                            // 立即清空
                             clear_hook_data_for_worker(worker_id);
-
-                            if config.enable_logging {
-                                eprintln!("[Worker {}] Hook data from call, returning with data", worker_id);
-                            }
-
-                            // 直接返回 hook data
                             let hook_json: JsonValue = serde_json::from_str(&hook_data)
                                 .map_err(|e| format!("Failed to parse hook data: {}", e))?;
-
                             return Ok(serde_json::json!({
                                 "__hook__": true,
                                 "worker_id": worker_id,
                                 "data": hook_json
                             }));
                         }
+
+                        // 检查是否有结果存储（op_store_result 触发的终止）
+                        if result_storage.has_result() {
+                            let json_str = result_storage.take().unwrap();
+                            return serde_json::from_str(&json_str)
+                                .map_err(|e| format!("Failed to parse result JSON: {}", e));
+                        }
                     }
                     return Err(error_msg);
                 }
                 Ok(result_handle) => {
-                    // Forget the result handle - we'll get the result from storage
                     std::mem::forget(result_handle);
                 }
             }
 
-            // 运行完整事件循环
+            // 运行事件循环 - op_store_result 会在结果存储后自动终止执行
             let event_loop_result = runtime
                 .run_event_loop(PollEventLoopOptions::default())
                 .await;
 
             if let Err(e) = event_loop_result {
-                // 检查 event loop 中的 terminate_execution 错误
                 let error_msg = format!("Event loop error: {}", e);
                 if error_msg.contains("execution terminated") {
-                    // 恢复 isolate 状态
                     runtime.v8_isolate().cancel_terminate_execution();
-
-                    if config.enable_logging {
-                        eprintln!("[Worker {}] Event loop terminated in call (hook), isolate recovered", worker_id);
-                    }
 
                     // 检查是否有 hook data
                     if let Some(hook_data) = get_hook_data_for_worker(worker_id) {
-                        // 立即清空
                         clear_hook_data_for_worker(worker_id);
-
-                        if config.enable_logging {
-                            eprintln!("[Worker {}] Hook data from call event loop, returning with data", worker_id);
-                        }
-
-                        // 直接返回 hook data
                         let hook_json: JsonValue = serde_json::from_str(&hook_data)
                             .map_err(|e| format!("Failed to parse hook data: {}", e))?;
-
                         return Ok(serde_json::json!({
                             "__hook__": true,
                             "worker_id": worker_id,
                             "data": hook_json
                         }));
                     }
+                    // 正常的结果返回终止，继续获取结果
+                } else {
+                    return Err(error_msg);
                 }
-                return Err(error_msg);
             }
 
             // 从 storage 获取结果
@@ -580,7 +604,6 @@ async fn execute_task(
                 .take()
                 .ok_or_else(|| "No result stored after event loop".to_string())?;
 
-            // 解析 JSON 字符串为 JsonValue
             serde_json::from_str(&json_str)
                 .map_err(|e| format!("Failed to parse result JSON: {}", e))
         }

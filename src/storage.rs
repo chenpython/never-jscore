@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
 use once_cell::sync::Lazy;
@@ -14,31 +14,33 @@ pub struct WorkerId(pub usize);
 ///
 /// 在调用 terminate_execution() 前保存 Hook 拦截的数据。
 /// 使用全局静态HashMap，每个Worker有独立的存储空间，避免数据竞争。
-static HOOK_DATA: Lazy<Arc<Mutex<HashMap<usize, String>>>> = Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
+static HOOK_DATA: Lazy<Arc<Mutex<HashMap<usize, String>>>> = Lazy::new(|| Arc::new(Mutex::new(HashMap::with_capacity(16))));
 
 /// JavaScript 执行结果存储
 ///
 /// 用于在 Rust 和 JavaScript 之间传递执行结果。
 /// 通过 Deno Core 的 op 机制，JavaScript 可以将结果存储到这里。
+///
+/// 性能优化：使用 Cell<bool> 替代 RefCell<bool>，减少借用检查开销
 pub struct ResultStorage {
     pub value: RefCell<Option<String>>,
-    early_return: RefCell<bool>,  // 标记是否是提前返回（用于Hook拦截）
-    terminated: RefCell<bool>,    // 标记是否应该终止runtime
+    early_return: Cell<bool>,  // 标记是否是提前返回（用于Hook拦截）
+    terminated: Cell<bool>,    // 标记是否应该终止runtime
 }
 
 impl ResultStorage {
     pub fn new() -> Self {
         Self {
             value: RefCell::new(None),
-            early_return: RefCell::new(false),
-            terminated: RefCell::new(false),
+            early_return: Cell::new(false),
+            terminated: Cell::new(false),
         }
     }
 
     pub fn clear(&self) {
         *self.value.borrow_mut() = None;
-        *self.early_return.borrow_mut() = false;
-        *self.terminated.borrow_mut() = false;
+        self.early_return.set(false);
+        self.terminated.set(false);
     }
 
     pub fn store(&self, value: String) {
@@ -49,24 +51,29 @@ impl ResultStorage {
         self.value.borrow_mut().take()
     }
 
+    /// 检查是否有结果存储（不取出）
+    pub fn has_result(&self) -> bool {
+        self.value.borrow().is_some()
+    }
+
     /// 标记为提前返回（Hook拦截）
     pub fn mark_early_return(&self) {
-        *self.early_return.borrow_mut() = true;
+        self.early_return.set(true);
     }
 
     /// 检查是否是提前返回
     pub fn is_early_return(&self) -> bool {
-        *self.early_return.borrow()
+        self.early_return.get()
     }
 
     /// 标记为已终止（强制停止runtime）
     pub fn mark_terminated(&self) {
-        *self.terminated.borrow_mut() = true;
+        self.terminated.set(true);
     }
 
     /// 检查是否应该终止
     pub fn is_terminated(&self) -> bool {
-        *self.terminated.borrow()
+        self.terminated.get()
     }
 }
 
